@@ -1,0 +1,16 @@
+* About
+  This is a local music player in the terminal
+* Methods:
+  - (x) Play(String) // can be both a path to a folder or a file
+  - (_) Append(String) // can be both a path to a folder or a file
+  - (_) Skip(u32) // number of songs to skip to
+  - (x) Pause()  // pauses the playing sound
+  - (x) Resume() // resumes the playing sound
+  - (x) Stop() // stops the playing sound and thus discarding it
+  - (x) Seek(f64) // move the playing cursor forward or backward
+  - (x) Volume(f64) // Changes volume
+  - (x) End() // terminates playing
+  - (x) Status() // 
+  - (x) show() //
+* TODO
+  - (x) make only methods to interact with the currently playing song
