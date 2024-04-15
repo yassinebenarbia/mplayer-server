@@ -1,0 +1,13 @@
+[package]
+name = "mplayer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ratatui = "0.26.1"
+zbus = "4.1.2"
+async-std = {version = "1.12.0", features = ["attributes"]}
+event-listener = "5.2.0"
+kira = {version = "0.8.7", features = ["serde"]}
