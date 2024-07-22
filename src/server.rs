@@ -44,13 +44,27 @@ impl Player {
         }
     }
 
-    /// seeks the player by the given duration
+    /// seeks the player by the given duration relative to the current seeker
     /// negative number meens seking backward and vice versa
     fn seek(&mut self, duration: f64) -> bool {
         match self.stream_handler.as_mut() {
             Some(handler) => {
-                handler.seek_by(duration).unwrap();
-                return true;
+                match handler.state() {
+                    PlaybackState::Playing => {
+                        handler.seek_by(duration).unwrap();
+                        return true;
+                    },
+                    PlaybackState::Pausing | PlaybackState::Paused => {
+                        self.audio_manager.resume(Tween::default()).unwrap();
+                        handler.seek_by(duration).unwrap();
+                        return true;
+                    },
+                    PlaybackState::Stopping  | PlaybackState::Stopped => {
+                        self.play(self.path.clone());
+                        self.seek(duration);
+                        return true
+                    },
+                }
             }
             None => return false,
         }
@@ -111,7 +125,6 @@ impl Player {
     fn end(&mut self) -> bool {
         let _ = match self.stream_handler.as_mut() {
             Some(handler) => {
-                handler.seek_to(0.0).unwrap();
                 handler.stop(Tween::default())
             },
             None => return false,
