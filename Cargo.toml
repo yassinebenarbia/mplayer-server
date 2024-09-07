@@ -1,13 +1,20 @@
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [package]
-name = "mplayer"
+authors = ["yasssine <yassine.bna@proton.me>"]
+name = "mplayer-server"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/yassinebenarbia/mplayer-server"
+description = "Simple dbus server to play music"
+keywords = ["music", "server", "linux", "zbus", "lofty", "audio"]
 
 [dependencies]
-ratatui = "0.26.1"
 zbus = "4.1.2"
 async-std = {version = "1.12.0", features = ["attributes"]}
 event-listener = "5.2.0"
 kira = {version = "0.8.7", features = ["serde"]}
+audiotags = "0.5.0"
+serde = { version = "1.0.204", features = ["serde_derive"] }
+lofty = "0.21.0"

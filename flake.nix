@@ -8,14 +8,24 @@
   outputs = { self, nixpkgs, utils, naersk }:
     utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
         unstable = import <nixpkgs-unstable> {};
         naersk-lib = pkgs.callPackage naersk { };
+
+        rust_overlay = import (builtins.fetchTarball "https://github.com/oxalica/rust-overlay/archive/master.tar.gz");
+        pkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
+        rustVersion = "1.79.0";
+        rust = pkgs.rust-bin.stable.${rustVersion}.default.override {
+        extensions = [
+          "rust-src" # for rust-analyzer
+          "rust-analyzer"
+          "rustc"
+          "cargo"
+        ];};
       in
       {
         defaultPackage = naersk-lib.buildPackage ./.;
         devShell = with pkgs; mkShell {
-          buildInputs = [  unstable.rustc pkg-config alsa-lib ];
+          buildInputs = [  rust pkg-config alsa-lib ];
         };
       });
 }
