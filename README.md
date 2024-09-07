@@ -1,5 +1,5 @@
 <h1 align="center">mplayer-server</h1>
-A [DBus](https://dbus.freedesktop.org/doc/api/html/) Music player server wirtten in [Rust](https://www.rust-lang.org/)
+A [DBus](https://dbus.freedesktop.org) Music player server wirtten in [Rust](https://www.rust-lang.org)
 
 # Thanks to
 - [Loft-rs](https://github.com/Serial-ATA/lofty-rs)
