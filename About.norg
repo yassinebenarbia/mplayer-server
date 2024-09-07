@@ -11,6 +11,12 @@
   - (x) Volume(f64) // Changes volume
   - (x) End() // terminates playing
   - (x) Status() // 
-  - (x) show() //
+  - (x) Show() //
+  - (x) Metadata() // returns metadata about the currently playing song
 * TODO
   - (x) make only methods to interact with the currently playing song
+  - (x) return metadata about the currently playing song to the user (cover image, song name, artist)
+  - ( ) migrate from audiotags to lofty
+  - ( ) It should be possible to specify the bust path in the config file
+  - ( ) migrate from audiotags to lofty
+
