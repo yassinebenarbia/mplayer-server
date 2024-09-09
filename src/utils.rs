@@ -15,6 +15,7 @@ pub fn log(data: &str, filename: &str) -> std::io::Result<std::fs::File>{
     let mut f = OpenOptions::new()
         .write(true)
         .append(true)
+        .create(true)
         .open(filename)?;
     writeln!(f, "{}", data)?;
     return std::io::Result::Ok(f)
