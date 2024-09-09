@@ -36,12 +36,12 @@ enum MutedState {
 }
 
 impl Music {
-    pub fn default(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         Self {
             title: Self::derive_title_from_path(&path),
             path,
             length: Duration::ZERO,
-            artist: String::from("Unkown"),
+            artist: String::from("Unknown"),
             genre: String::from("Unknown"),
         }
     }
@@ -99,7 +99,7 @@ impl<'de> serde::Deserialize<'de> for ImageType {
                 } else if v.contains("Gif") {
                     Ok(ImageType(audiotags::MimeType::Gif))
                 } else {
-                    panic!("unkwon field")
+                    panic!("Unknown field")
                 }
             }
         }
@@ -186,9 +186,9 @@ impl<'a> Player {
         match audiotags::Tag::new().read_from_path(self.path.clone()) {
             Ok(tag) => {
                 println!("extracting data from file...");
-                let genre: String = tag.genre().unwrap_or("Unkown").to_string().replace('\0', "");
-                let title: String = tag.title().unwrap_or("Unkown").to_string().replace('\0', "");
-                let artist: String = tag.artist().unwrap_or("Unkown").to_string().replace('\0', "");
+                let genre: String = tag.genre().unwrap_or("Unknown").to_string().replace('\0', "");
+                let title: String = tag.title().unwrap_or("Unknown").to_string().replace('\0', "");
+                let artist: String = tag.artist().unwrap_or("Unknown").to_string().replace('\0', "");
                 println!("crating album cover...");
                 let cover = tag.album_cover().unwrap_or(audiotags::Picture{
                     mime_type: audiotags::MimeType::Jpeg,
@@ -396,13 +396,13 @@ impl<'a> Player {
                     }
                 }else {
                     println!("couldn't read the music prob in {:?}, falling to default method.", path);
-                    return Music::default(path)
+                    return Music::new(path)
                 }
             },
             Err(e) => {
                 println!("couldn't create the Music object from {:?}, returning the default object.", path);
                 println!("Error: {}", e);
-                return Music::default(path);
+                return Music::new(path);
             } 
         }
     }
