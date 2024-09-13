@@ -21,6 +21,50 @@ use std::{error::Error, path::PathBuf, time::Duration};
 use zbus::{interface, connection};
 use audiotags;
 
+
+#[derive(PartialEq, Eq, Debug, Ord, PartialOrd, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(zbus::zvariant::Type)]
+struct RunStatus{
+    error_messge: String,
+    status_type: StatusOption,
+}
+
+#[derive(PartialEq, Eq, Debug, Ord, PartialOrd, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(zbus::zvariant::Type)]
+enum StatusOption {
+    Ok,
+    OutOfRange,
+    CoudntPreformAction,
+    CoudntGetSHandler,
+    CoudntSeek,
+    CoudntPauseManager,
+    CoudntPauseHandler,
+    CoudntResumeManager,
+    CoudntResumeHandler,
+    WrongPath,
+    CoudntReadMusicData,
+}
+
+impl RunStatus {
+    fn new(msg: String, status: StatusOption) -> Self {
+        Self {
+            error_messge: msg, status_type: status
+        }
+    }
+
+    fn ok() -> Self {
+        Self::new(String::from(""), StatusOption::Ok)
+    }
+
+    fn handler_errror() -> Self {
+        return RunStatus::new(
+            format!("coudn't get stream handler!"),
+            StatusOption::CoudntGetSHandler
+        )
+    }
+}
+
+
 #[derive(PartialEq, Eq, Debug, Ord, PartialOrd, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[derive(zbus::zvariant::Type)]
 pub struct Music {
@@ -140,11 +184,11 @@ struct Player{
 
 #[interface(name = "org.zbus.mplayerServer")]
 impl<'a> Player {
-    /// changes the volume of the player, return true if no panic happened
-    fn volume(&mut self, amount: f64) -> bool{
+    /// changes the volume of the player
+    fn volume(&mut self, amount: f64) -> RunStatus{
         println!("changed volume to: {}", amount);
         if amount > 100.0 || amount < 0.0 {
-            return true
+            RunStatus::new("volume is out of range!".to_string(), StatusOption::OutOfRange);
         }
 
         let volume = amount / 100.0;
@@ -153,31 +197,33 @@ impl<'a> Player {
         match self.stream_handler.as_mut() {
             Some(handler) => {
                 match handler.set_volume(volume, Tween::default()){
-                    Ok(_) => return true,
-                    Err(_) => return false,
+                    Ok(_) => return RunStatus::ok(),
+                    // Err(e) => foramt!("couldn't set volume to {}\nError: {}", volume, e),
+                    Err(e) => return RunStatus::new(
+                        format!("couldn't set volume to {}\nError: {}", volume.clone(), e),
+                        StatusOption::CoudntPreformAction),
                 }
             }
-            None => return false,
+            None => return RunStatus::handler_errror(),
         }
     }
 
     /// Toggle volume
-    fn toggle_mute(&mut self) -> bool{
+    fn toggle_mute(&mut self) -> RunStatus{
         println!("mute toggled!");
         match self.muted_state {
             MutedState::UnMuted => {
                 self.muted_volume = self.volume;
                 self.volume(0.0);
                 self.muted_state = MutedState::Muted;
-                return true;
             },
             MutedState::Muted => {
                 self.volume = self.muted_volume;
                 self.volume(self.volume * 100.0);
                 self.muted_state = MutedState::UnMuted;
-                return true;
             },
         }
+        RunStatus::ok()
     }
 
     /// Returns current audio [Metadata]
@@ -234,32 +280,38 @@ impl<'a> Player {
     /// if state is pausing it:
     ///     - resumes the currently playing song 
     ///     - seeks by the given duration
-    fn seek(&mut self, duration: f64) -> bool {
+    fn seek(&mut self, duration: f64) -> RunStatus {
         println!("seeking by: {}", duration);
         match self.stream_handler.as_mut() {
             Some(handler) => {
                 match handler.state() {
                     PlaybackState::Playing => {
                         match handler.seek_by(duration) {
-                            Ok(_) => return true,
-                            Err(_) => return false,
+                            Err(e) => return RunStatus::new(
+                                format!("coudn't seek player by {} seconds\nError: {}", duration, e),
+                                StatusOption::CoudntSeek
+                            ),
+                            Ok(_) => return RunStatus::ok(),
                         }
                     },
                     PlaybackState::Stopping  | PlaybackState::Stopped => {
                         self.play(self.path.clone());
                         self.seek(duration);
-                        return true
+                        RunStatus::ok()
                     },
                     PlaybackState::Pausing | PlaybackState::Paused => {
                         self.resume();
                         match self.stream_handler.as_mut().unwrap().seek_by(duration) {
-                            Ok(_) => return true,
-                            Err(_) => return false,
+                            Err(e) => return RunStatus::new(
+                                format!("coudn't seek player by {} seconds\nError: {}", duration, e),
+                                StatusOption::CoudntSeek
+                            ),
+                            Ok(_) => return RunStatus::ok(),
                         }
                     }
                 }
             }
-            None => return false,
+            None =>return RunStatus::handler_errror()
         }
     }
 
@@ -284,51 +336,66 @@ impl<'a> Player {
         }
     }
 
-    /// Pauses playing the currently playing song, returns true if no panic happened
-    fn pause(&mut self) -> bool {
+    /// Pauses playing the currently playing song
+    fn pause(&mut self) -> RunStatus {
         println!("pausing!");
-        if let Ok(_) = self.audio_manager.pause(Tween::default()) {
-            if let Ok(_) = self.stream_handler.as_mut().unwrap().pause(Tween::default()) {
-                return true
-
-            }else {
-                return false
-            }
+        match self.audio_manager.pause(Tween::default()) {
+            Ok(_) => {
+                match self.stream_handler.as_mut().unwrap().pause(Tween::default()) {
+                    Ok(_) => return RunStatus::ok(),
+                    Err(e) => return RunStatus::new(
+                        format!("coudn't pause audio manager!\nError: {}", e), 
+                        StatusOption::CoudntPauseHandler
+                    )
+                }
+            },
+            Err(e) => return RunStatus::new(
+                format!("coudn't pause audio manager!\nError: {}", e), 
+                StatusOption::CoudntPauseManager,
+            ),
         }
-        return false
     }
 
-    /// Resumes playing the currently paused song, returns true if no panic happened
-    fn resume(&mut self) -> bool {
+    /// Resumes playing the currently paused song
+    fn resume(&mut self) -> RunStatus{
         println!("resuming");
-        if let Ok(_) = self.audio_manager.resume(Tween::default()) {
-            if let Ok(_) = self.stream_handler.as_mut().unwrap().resume(Tween::default()) {
-                return true;
-            }else {
-                return false;
-            }
+        match self.audio_manager.resume(Tween::default()) {
+            // TODO: catch the unwrap
+            Ok(_) => match self.stream_handler.as_mut().unwrap().resume(Tween::default()) {
+                Ok(_) => RunStatus::ok(),
+                Err(e) => return RunStatus::new(
+                    format!("coudn't resume the stream handler!\nError: {}", e),
+                    StatusOption::CoudntResumeHandler
+                ),
+            },
+            Err(e) => return RunStatus::new(
+                format!("coudn't resume the audio manager!\nError: {}", e),
+                StatusOption::CoudntResumeManager
+            ),
         }
-        return false
     }
 
-    /// Terminate playing, returns true if no panic happened
-    fn end(&mut self) -> bool {
+    /// Terminates playing
+    fn end(&mut self) -> RunStatus{
         println!("stopping!");
         let _ = match self.stream_handler.as_mut() {
             Some(handler) => {
                 handler.stop(Tween::default())
             },
-            None => return false,
+            None => return RunStatus::handler_errror(),
         };
-        true
+        RunStatus::ok()
     }
 
-    /// Plays the audio from the file path, returns true if no panic happened
-    fn play(&mut self, path: PathBuf) -> bool {
+    /// Plays the audio from the file path
+    fn play(&mut self, path: PathBuf) -> RunStatus {
         println!("Playing");
         if path.is_dir() {
             eprintln!("Expected a file path, got a directory!\ndirectory: {:?}", path);
-            return false 
+            return RunStatus::new(
+                format!("Expected a file path, got a directory!\ndirectory: {:?}", path),
+                StatusOption::WrongPath
+            )
         }else {
             self.path = path;
         }
@@ -352,9 +419,12 @@ impl<'a> Player {
 
                 self.stream_handler = Some(self.audio_manager.play(sound_data).unwrap());
             },
-            _ => return false
+            _ => return RunStatus::new(
+                format!("coudn't read sound data"),
+                StatusOption::CoudntReadMusicData
+            )
         };
-        true
+        RunStatus::ok()
     }
 
     /// Returns the player status:
