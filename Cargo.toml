@@ -15,6 +15,6 @@ zbus = "4.1.2"
 async-std = {version = "1.12.0", features = ["attributes"]}
 event-listener = "5.2.0"
 kira = {version = "0.8.7", features = ["serde"]}
-audiotags = "0.5.0"
 serde = { version = "1.0.204", features = ["serde_derive"] }
 lofty = "0.21.0"
+regex = "1.11.0"
