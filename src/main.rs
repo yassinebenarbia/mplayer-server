@@ -1,10 +1,19 @@
 use std::error::Error;
+use tracing::instrument;
+
+mod light_client;
 mod server;
 mod utils;
 
-#[async_std::main]
+#[tokio::main]
+#[instrument(name = "", skip_all)]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let server = server::Server::default();
+    #[cfg(feature = "debug")]
+    let server = server::Server::default().await.start_tracing();
+
+    #[cfg(not(feature = "debug"))]
+    let server = server::Server::default().await;
+
     server.start().await?;
     Ok(())
 }
