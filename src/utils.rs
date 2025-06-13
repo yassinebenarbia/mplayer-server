@@ -8,24 +8,23 @@ pub trait StringFeatures {
 }
 
 /// logs _data_ to a _file_ in a incremantive manner
-/// 
-/// Panics: 
+///
+/// Panics:
 /// - if file does not exist
-pub fn log(data: &str, filename: &str) -> std::io::Result<std::fs::File>{
+pub fn log(data: &str, filename: &str) -> std::io::Result<std::fs::File> {
     let mut f = OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
         .open(filename)?;
     writeln!(f, "{}", data)?;
-    return std::io::Result::Ok(f)
+    return std::io::Result::Ok(f);
 }
 
 impl StringFeatures for String {
     fn insert_if_empty(&mut self, content: &str) {
-       if self.is_empty() {
-           self.push_str(content);
-       } 
+        if self.is_empty() {
+            self.push_str(content);
+        }
     }
 }
-

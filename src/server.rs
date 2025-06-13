@@ -1,71 +1,302 @@
-use event_listener::{Event, Listener};
-use serde::ser::Serializer;
-use serde::Deserializer;
-use lofty::{self, file::{AudioFile, TaggedFileExt}, tag::Accessor};
-use kira::{
-    manager::{
-        AudioManager, AudioManagerSettings, backend::DefaultBackend
-    },
-    sound::{
-        
-        streaming::{
-            StreamingSoundData, StreamingSoundSettings, StreamingSoundHandle
-        },
-        FromFileError, PlaybackState
-    },
-    tween::Tween,
-    clock::{ClockSpeed, ClockHandle}
+// TODO: add tests for sorting and stuff
+// TODO: support connection over over http
+// TODO: handle the unwrap calls (this is a mess)
+use lofty::{
+    self,
+    file::{AudioFile, TaggedFileExt},
+    picture::{MimeType, PictureType},
+    tag::Accessor,
 };
-use std::{error::Error, path::PathBuf, time::Duration};
+use rand::seq::SliceRandom;
+use regex::Regex;
+use rodio::Sink;
+use serde::{ser::Serializer, Deserializer};
+use std::{
+    borrow::Cow, error::Error, fmt::Display, io::BufReader, path::PathBuf, str::FromStr,
+    time::Duration,
+};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::{error, info, Level};
+use tracing_subscriber::FmtSubscriber;
+use zbus::{connection, interface, object_server::SignalEmitter, zvariant::FilePath, Connection};
 
-use zbus::{interface, connection};
-use audiotags;
+use crate::{instrument, light_client::LightClientProxy};
 
-#[derive(PartialEq, Eq, Debug, Ord, PartialOrd, Clone, Default, serde::Deserialize, serde::Serialize)]
-#[derive(zbus::zvariant::Type)]
+#[derive(
+    PartialEq,
+    Eq,
+    Debug,
+    Ord,
+    PartialOrd,
+    Clone,
+    serde::Deserialize,
+    serde::Serialize,
+    zbus::zvariant::Type,
+)]
+pub struct RunStatus {
+    error_messge: String,
+    status_type: StatusOption,
+}
+
+#[derive(
+    PartialEq,
+    Eq,
+    Debug,
+    Ord,
+    PartialOrd,
+    Clone,
+    serde::Deserialize,
+    serde::Serialize,
+    zbus::zvariant::Type,
+)]
+enum StatusOption {
+    Ok,
+    OutOfRange,
+    CoudntPreformAction,
+    CoudntGetSHandler,
+    CoudntSeek,
+    CoudntPauseManager,
+    CoudntPauseHandler,
+    CoudntResumeManager,
+    CoudntResumeHandler,
+    WrongPath,
+    CoudntReadMusicData,
+}
+
+impl RunStatus {
+    fn error(msg: String, status: StatusOption) -> Self {
+        Self {
+            error_messge: msg,
+            status_type: status,
+        }
+    }
+
+    fn ok() -> Self {
+        Self::error(String::from(""), StatusOption::Ok)
+    }
+
+    #[allow(unused)]
+    fn handler_errror() -> Self {
+        return RunStatus::error(
+            format!("coudn't get stream handler!"),
+            StatusOption::CoudntGetSHandler,
+        );
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum PlayAction {
+    Volume(f32),
+    PlayFromIndex(u32),
+    TogglePlay,
+    Stop,
+    Quit,
+    Ended,
+    Pause,
+    PlayNextMusic,
+    PlayPreviousMusic,
+    Resume,
+    Seek(f64),
+    Repeat(Repeat),
+    Sort(Sort),
+    GetPlaylist,
+    GetLyrics,
+    GetRepeat,
+    GetSort,
+    GetPlayedDuration,
+    GetPreviousMusic,
+    GetNextMusic,
+    GetPlayingStatus,
+    GetVolume,
+    GetIndex,
+    GetPlayingMusic,
+    GetPlaying,
+    GetPlayingIndex,
+    GetMetadata,
+    GetTimer,
+    GetPlayerStatus,
+    ReloadConfig(Config),
+    ToggleMute,
+}
+
+#[derive(
+    PartialEq, Eq, Debug, Clone, Default, serde::Deserialize, serde::Serialize, zbus::zvariant::Type,
+)]
 pub struct Music {
     pub title: String,
     pub length: Duration,
-    pub path: PathBuf,
+    pub path: FilePath<'static>,
     pub artist: String,
     pub genre: String,
 }
 
-enum MutedState {
-    Muted, UnMuted
+impl Display for Music {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\n============================================\n")?;
+        write!(f, "TITLE: {}\n", self.title)?;
+        write!(f, "ARTIST: {}\n", self.artist)?;
+        #[cfg(feature = "full-log")]
+        {
+            write!(f, "PATH: {:?}\n", self.path)?;
+            write!(f, "LENGTH: {:?}\n", self.length)?;
+            write!(f, "GENRE: {}\n", self.genre)?;
+        }
+        write!(f, "============================================\n")
+    }
 }
 
 impl Music {
-    pub fn new(path: PathBuf) -> Self {
+    #[allow(unused)]
+    fn new(title: String, length: Duration, path: PathBuf, artist: String, genre: String) -> Self {
         Self {
-            title: Self::derive_title_from_path(&path),
-            path,
-            length: Duration::ZERO,
-            artist: String::from("Unknown"),
-            genre: String::from("Unknown"),
+            title,
+            length,
+            path: FilePath::from(path),
+            artist,
+            genre,
         }
     }
 
-    fn derive_title_from_path(path: &PathBuf) -> String {
-        match lofty::probe::Probe::open(path) {
-            Ok(v) =>if let Some(t) = v.read().unwrap().primary_tag() {
-                t.title().unwrap_or(path.file_name().unwrap().to_string_lossy()).to_string()
-            }else {
-                path.file_name().unwrap().to_string_lossy().to_string()
-            },
-                Err(_) => String::from("Default"),
+    pub fn from_path(path: PathBuf) -> Self {
+        if path.to_str().unwrap_or("").is_empty() {
+            return Self::default();
+        }
+        let res = lofty::probe::Probe::open(PathBuf::from(&path).as_path()).unwrap();
+        match res.read() {
+            Ok(tags_read) => {
+                let ptag_type = tags_read.primary_tag_type();
+                let tag = tags_read.tag(ptag_type);
+                match tag {
+                    Some(tag) => {
+                        let title = tag.title().unwrap_or(Cow::from("Unknown"));
+                        let genre = tag.genre().unwrap_or(Cow::from("Unknown"));
+                        let artist = tag.artist().unwrap_or(Cow::from("Unknown"));
+                        let properties = tags_read.properties();
+                        let duration = properties.duration();
+                        return Self {
+                            title: String::from(title),
+                            path: FilePath::from(path),
+                            length: duration,
+                            artist: String::from(artist),
+                            genre: String::from(genre),
+                        };
+                    }
+                    None => Self::default(),
+                }
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn extract_matadata(&mut self) -> Metadata {
+        info!("reading metadata from file...");
+        let res = lofty::probe::Probe::open(PathBuf::from(self.path.clone()));
+        match res {
+            Ok(probe) => {
+                if let Ok(x) = probe.read() {
+                    let lyrics: Option<Lyrics> = self.extract_lyrics();
+                    let ptag = x.primary_tag_type();
+                    let tag = x.tag(ptag);
+                    match tag {
+                        Some(tag) => {
+                            let title = tag.title().unwrap_or_default();
+                            let genre = tag.genre().unwrap_or_default();
+                            let artist = tag.artist().unwrap_or_default();
+                            let (picture_data, picture_type) =
+                                match tag.get_picture_type(PictureType::CoverFront) {
+                                    Some(p) => (p.data(), p.mime_type().unwrap()),
+                                    None => ("".as_bytes(), &MimeType::Jpeg),
+                                };
+                            info!("metadata read successfully!");
+                            #[cfg(feature = "full-log")]
+                            info!("Sending Lyrics: {:#?}", lyrics);
+                            return Metadata {
+                                artist: artist.into(),
+                                title: title.into(),
+                                genre: genre.into(),
+                                lyrics: lyrics.unwrap_or_default(),
+                                cover: Picture {
+                                    data: picture_data.into(),
+                                    tp: ImageType(picture_type.to_owned()),
+                                },
+                            };
+                        }
+                        None => return Metadata::default(),
+                    }
+                } else {
+                    return Metadata::default();
+                }
+            }
+            Err(_) => return Metadata::default(),
+        }
+    }
+
+    fn extract_lyrics(&self) -> Option<Lyrics> {
+        let res = lofty::probe::Probe::open(PathBuf::from(self.path.clone()));
+        match res {
+            Ok(probe) => {
+                if let Ok(x) = probe.read() {
+                    let mut lyrics: Option<Lyrics> = None;
+                    let ptag = x.primary_tag_type();
+                    let tag = x.tag(ptag);
+                    match tag {
+                        Some(tag) => {
+                            for item in tag.get_items(&lofty::tag::ItemKey::Lyrics) {
+                                match item.key() {
+                                    lofty::tag::ItemKey::Lyrics => {
+                                        lyrics = Some(Lyrics::from_str(
+                                            item.value().text().unwrap_or_default(),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            return lyrics;
+                        }
+                        None => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+
+    fn compare_by(&self, sort: Sort, other: &Music) -> std::cmp::Ordering {
+        match sort {
+            Sort::ByTitleAscending => {
+                return self.title.cmp(&other.title);
+            }
+            Sort::ByTitleDescending => {
+                return self.title.cmp(&other.title).reverse();
+            }
+            Sort::ByDurationAscending => {
+                return self.length.cmp(&other.length);
+            }
+            Sort::ByDurationDescending => {
+                return self.length.cmp(&other.length).reverse();
+            }
+            Sort::ArtistAscending => {
+                return self.artist.cmp(&other.artist);
+            }
+            Sort::ArtistDescending => {
+                return self.artist.cmp(&other.artist).reverse();
+            }
+            Sort::Shuffle => {
+                return std::cmp::Ordering::Equal;
+            }
         }
     }
 }
 
-
 #[derive(Debug, Clone)]
-pub struct ImageType(audiotags::MimeType);
+pub struct ImageType(lofty::picture::MimeType);
 
 impl serde::Serialize for ImageType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer 
+        S: Serializer,
     {
         let c_as_str = format!("{:?}", self.0);
         serializer.serialize_str(&c_as_str)
@@ -75,7 +306,7 @@ impl serde::Serialize for ImageType {
 impl<'de> serde::Deserialize<'de> for ImageType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: Deserializer<'de> 
+        D: Deserializer<'de>,
     {
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
@@ -86,18 +317,18 @@ impl<'de> serde::Deserialize<'de> for ImageType {
             }
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
             where
-                E: serde::de::Error, 
+                E: serde::de::Error,
             {
                 if v.contains("Jpeg") {
-                    Ok(ImageType(audiotags::MimeType::Jpeg))
+                    Ok(ImageType(MimeType::Jpeg))
                 } else if v.contains("Png") {
-                    Ok(ImageType(audiotags::MimeType::Png))
+                    Ok(ImageType(MimeType::Png))
                 } else if v.contains("Tiff") {
-                    Ok(ImageType(audiotags::MimeType::Tiff))
+                    Ok(ImageType(MimeType::Tiff))
                 } else if v.contains("Bmp") {
-                    Ok(ImageType(audiotags::MimeType::Bmp))
+                    Ok(ImageType(MimeType::Bmp))
                 } else if v.contains("Gif") {
-                    Ok(ImageType(audiotags::MimeType::Gif))
+                    Ok(ImageType(MimeType::Gif))
                 } else {
                     panic!("Unknown field")
                 }
@@ -108,78 +339,330 @@ impl<'de> serde::Deserialize<'de> for ImageType {
 }
 
 impl zbus::zvariant::Type for ImageType {
-    fn signature() -> zbus::zvariant::Signature<'static> {
-        zbus::zvariant::Signature::from_str_unchecked("s")
-    }
+    const SIGNATURE: &'static zbus::zvariant::Signature = &zbus::zvariant::Signature::Str;
 }
 
 #[derive(Debug, Clone, zbus::zvariant::Type, serde::Deserialize, serde::Serialize)]
-struct Picture{
+struct Picture {
     data: Vec<u8>,
-    tp: ImageType
+    tp: ImageType,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, zbus::zvariant::Type)]
-pub struct Metadata {
-    title: String, 
-    artist: String,
-    genre: String,
-    cover: Picture,
+#[derive(Debug, Clone, zbus::zvariant::Type, serde::Serialize, serde::Deserialize)]
+pub struct Line {
+    content: String,
+    timestamp: Duration,
+}
+impl Display for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{:?}] {}", self.timestamp, self.content)
+    }
 }
 
-struct Player{
-    path: PathBuf,
-    audio_manager: AudioManager,
-    stream_handler: Option<StreamingSoundHandle<FromFileError>>,
-    clock: ClockHandle,
-    volume: f64,
-    muted_volume: f64,
-    muted_state: MutedState,
-    song_length: f64,
-}
-
-#[interface(name = "org.zbus.mplayerServer")]
-impl<'a> Player {
-    /// changes the volume of the player, return true if no panic happened
-    fn volume(&mut self, amount: f64) -> bool{
-        println!("changed volume to: {}", amount);
-        if amount > 100.0 || amount < 0.0 {
-            return true
+impl Default for Line {
+    fn default() -> Self {
+        Line {
+            content: String::new(),
+            timestamp: Duration::ZERO,
         }
+    }
+}
 
-        let volume = amount / 100.0;
-        self.volume = volume;
+impl Line {
+    #[allow(unused)]
+    pub fn new(content: String, timestamp: Duration) -> Self {
+        Self { content, timestamp }
+    }
 
-        match self.stream_handler.as_mut() {
-            Some(handler) => {
-                match handler.set_volume(volume, Tween::default()){
-                    Ok(_) => return true,
-                    Err(_) => return false,
-                }
-            }
+    pub fn is_timed(line: &str) -> bool {
+        // TODO: represents the minutes, seconds, and text of a line as a separate struct
+        let re =
+            Regex::new(r#"^\[(?P<minutes>\d+):(?P<seconds>\d+\.\d+)\]? *(?P<text>.*)"#).unwrap();
+        match re.captures(line) {
+            Some(_) => return true,
             None => return false,
         }
     }
 
-    /// Toggle volume
-    fn toggle_mute(&mut self) -> bool{
-        println!("mute toggled!");
-        match self.muted_state {
-            MutedState::UnMuted => {
-                self.muted_volume = self.volume;
-                self.volume(0.0);
-                self.muted_state = MutedState::Muted;
-                return true;
-            },
-            MutedState::Muted => {
-                self.volume = self.muted_volume;
-                self.volume(self.volume * 100.0);
-                self.muted_state = MutedState::UnMuted;
-                return true;
-            },
+    #[allow(unused)]
+    pub fn set_line(&mut self, content: String) {
+        self.content = content;
+    }
+
+    #[allow(unused)]
+    pub fn set_time(&mut self, timestamp: Duration) {
+        self.timestamp = timestamp;
+    }
+
+    #[allow(unused)]
+    pub fn from_string(content: String) -> Self {
+        Self::from_str(&content)
+    }
+
+    pub fn from_timed_str(line: &str) -> Self {
+        let re = Regex::new(r#"^\[(?P<minutes>\d+):(?P<seconds>\d+\.\d+)\] (?P<text>.*)"#).unwrap();
+        match re.captures(line) {
+            Some(p) => {
+                let lyrics = p.name("text").unwrap().as_str();
+                let minutes = p.name("minutes").unwrap().as_str().parse::<f64>().unwrap();
+                let seconds = p.name("seconds").unwrap().as_str().parse::<f64>().unwrap();
+                Self {
+                    content: lyrics.to_string(),
+                    timestamp: Duration::from_secs_f64(seconds + minutes * 60.0),
+                }
+            }
+            None => {
+                return Self {
+                    content: line.to_string(),
+                    ..Default::default()
+                };
+            }
         }
     }
 
+    pub fn from_untimed_str(line: &str) -> Self {
+        Self {
+            content: line.to_string(),
+            timestamp: Duration::ZERO,
+        }
+    }
+
+    pub fn from_str(line: &str) -> Self {
+        if Line::is_timed(line) {
+            Line::from_timed_str(line)
+        } else {
+            Line::from_untimed_str(line)
+        }
+    }
+
+    /// Converts a duration of form string of the folowing template `[xx:yy.zz]` to a [Duration]
+    #[allow(unused)]
+    fn get_duation(content: &str) -> Duration {
+        let times = content.get(1..content.len() - 1).unwrap().split_once(':');
+        info!("time: {:?}", content);
+        Duration::from_secs_f64(
+            times.unwrap().0.parse::<f64>().unwrap_or(0.0) * 60.0
+                + times.unwrap().1.parse::<f64>().unwrap_or(0.0),
+        )
+    }
+}
+
+#[derive(Debug, Clone, zbus::zvariant::Type, serde::Deserialize, serde::Serialize)]
+pub struct Lyrics {
+    // TODO: CHANGE THE NAME OF THIS TO "is_timed"
+    time_is_correct: bool,
+    lines: Vec<Line>,
+}
+
+impl Display for Lyrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\n============================================\n")?;
+        write!(f, "TIME IS CORRECT: {}\n", self.time_is_correct)?;
+        write!(f, "\n")?;
+        for line in &self.lines {
+            write!(f, "{line}\n")?;
+        }
+        write!(f, "============================================\n")
+    }
+}
+
+impl Default for Lyrics {
+    fn default() -> Self {
+        Self {
+            lines: vec![],
+            time_is_correct: false,
+        }
+    }
+}
+
+impl Lyrics {
+    pub fn new(lines: Vec<Line>, time_is_valid: bool) -> Self {
+        Self {
+            lines,
+            time_is_correct: time_is_valid,
+        }
+    }
+
+    #[allow(unused)]
+    pub fn push_line(&mut self, line: Line) {
+        self.lines.push(line);
+    }
+
+    #[allow(unused)]
+    pub fn inser_line(&mut self, index: usize, line: Line) {
+        self.lines.insert(index, line);
+    }
+
+    #[allow(unused)]
+    pub fn sort_lines_chrono(&mut self) {
+        todo!()
+    }
+
+    #[allow(unused)]
+    pub fn is_sorted_chonologicaly(&self) -> bool {
+        todo!()
+    }
+
+    #[allow(unused)]
+    pub fn set_time_is(&mut self, time_is_correct: bool) {
+        self.time_is_correct = time_is_correct;
+    }
+
+    /// checks agains this format on each line, if all lines are formatted
+    /// correctly, it returns `true`, otherwise `false`
+    /// format: `[xx:yy.zz] rest of the text here...`
+    pub fn is_timed(lyrics: &str) -> bool {
+        // TODO: represents the minutes, seconds, and text of a line as a separate struct
+        for line in lyrics.lines() {
+            let re =
+                Regex::new(r#"^\[(?P<minutes>\d+):(?P<seconds>\d+\.\d+)\] (?P<text>.*)"#).unwrap();
+            match re.captures(line) {
+                Some(_) => return true,
+                None => {}
+            }
+        }
+        return false;
+    }
+
+    pub fn from_str(lyrics: &str) -> Self {
+        let mut lines: Vec<Line> = vec![];
+        let with_time_stamps = Self::is_timed(lyrics);
+        for l in lyrics.lines() {
+            lines.push(Line::from_str(l));
+        }
+        Self::new(lines, with_time_stamps)
+    }
+}
+
+// TODO: Stop using STRING all over the place
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, zbus::zvariant::Type)]
+pub struct Metadata {
+    title: String,
+    artist: String,
+    genre: String,
+    cover: Picture,
+    lyrics: Lyrics,
+}
+
+impl Default for Metadata {
+    fn default() -> Self {
+        Metadata {
+            title: String::from("None"),
+            artist: String::from("None"),
+            genre: String::from("None"),
+            lyrics: Lyrics::default(),
+            cover: Picture {
+                data: vec![0],
+                tp: ImageType(lofty::picture::MimeType::Jpeg),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Response {
+    Timer((f32, f32)),
+    Music(Music),
+    Playlist(Playlist),
+    PlayingIndex(u32),
+    Sort(Sort),
+    Repeat(Repeat),
+    Metadata(Metadata),
+    Lyrics(Lyrics),
+    PlayedDuration(Duration),
+    Volume(f32),
+    PreviousMusic(Music),
+    NextMusic(Music),
+    PlayingStatus(PlayingStatus),
+    PlayerStatus(PlayerStatus),
+}
+
+struct Player {
+    // controller: awedio::backends::CpalBackend,
+    sender: UnboundedSender<PlayAction>,
+    playlist: Playlist,
+    response_reciver: UnboundedReceiver<Response>,
+}
+
+#[interface(name = "org.zbus.mplayerServer")]
+impl<'a> Player {
+    async fn reload_config(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
+        let config = Config::try_from_env().unwrap_or_default();
+        self.playlist.reload_from_config(&config);
+        // ---------------------------------------------------------------
+        self.sender.send(PlayAction::ReloadConfig(config)).unwrap();
+        self.config_reloaded(emitter).await.unwrap();
+    }
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn volume_changed(&self, emitter: SignalEmitter<'_>, amount: f32) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn config_reloaded(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
+
+    async fn volume(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        amount: f32,
+    ) -> RunStatus {
+        self.sender.send(PlayAction::Volume(amount)).unwrap();
+        self.volume_changed(emitter, amount).await.unwrap();
+        RunStatus::ok()
+    }
+
+    async fn get_volume(&mut self) -> f32 {
+        info!("Requesting volume");
+        self.sender.send(PlayAction::GetVolume).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Volume(volume) => return volume,
+                    _ => {
+                        info!("Got unexpected response");
+                        info!("Response: {:?}", data);
+                        return 1.0;
+                    }
+                },
+                None => {
+                    return 1.0;
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn get_playing_status(&mut self) -> PlayingStatus {
+        info!("Requesting playing status");
+        self.sender.send(PlayAction::GetPlayingStatus).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::PlayingStatus(status) => return status,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return PlayingStatus::default();
+                    }
+                },
+                None => {
+                    return PlayingStatus::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+  
     /// Returns current audio [Metadata]
     fn metadata(&mut self) -> Metadata {
         println!("reading data from file...");
@@ -207,216 +690,453 @@ impl<'a> Player {
                         tp: ImageType(tp)
                     },
                 }
-            },
-            Err(_) => {
-                Metadata {
-                    title: String::from("None"),
-                    artist: String::from("None"),
-                    genre: String::from("None"),
-                    cover: Picture {
-                        data: vec![0],
-                        tp: ImageType(audiotags::MimeType::Jpeg)
-                    },
-                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
 
-            },
-        }
+    async fn get_repeat(&mut self) -> Repeat {
+        info!("Requesting repeat status status");
+        self.sender.send(PlayAction::GetRepeat).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Repeat(sort) => return sort,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return Repeat::default();
+                    }
+                },
+                None => {
+                    return Repeat::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn get_next_music(&mut self) -> Music {
+        info!("Requesting next music info");
+        self.sender.send(PlayAction::GetNextMusic).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::NextMusic(music) => return music,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return Music::default();
+                    }
+                },
+                None => {
+                    return Music::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn get_previous_music(&mut self) -> Music {
+        info!("Requesting previous music info");
+        self.sender.send(PlayAction::GetPreviousMusic).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::PreviousMusic(music) => return music,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return Music::default();
+                    }
+                },
+                None => {
+                    return Music::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn get_playing_index(&mut self) -> u32 {
+        info!("Requesting playing index");
+        self.sender.send(PlayAction::GetPlayingIndex).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::PlayingIndex(index) => return index,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return 0;
+                    }
+                },
+                None => {
+                    return 0;
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// seeks the player by the given duration relative to the current playing timer
     /// negative number meens seking backward and vice versa
-    /// 
+    ///
     /// - if state is in playing it:
     ///     - seeks by the give nduration
     /// - if state is Stopping it:
     ///     - plays the preivously played song
     ///     - seeks by the given duration
     /// if state is pausing it:
-    ///     - resumes the currently playing song 
+    ///     - resumes the currently playing song
     ///     - seeks by the given duration
-    fn seek(&mut self, duration: f64) -> bool {
-        println!("seeking by: {}", duration);
-        match self.stream_handler.as_mut() {
-            Some(handler) => {
-                match handler.state() {
-                    PlaybackState::Playing => {
-                        match handler.seek_by(duration) {
-                            Ok(_) => return true,
-                            Err(_) => return false,
-                        }
-                    },
-                    PlaybackState::Stopping  | PlaybackState::Stopped => {
-                        self.play(self.path.clone());
-                        self.seek(duration);
-                        return true
-                    },
-                    PlaybackState::Pausing | PlaybackState::Paused => {
-                        self.resume();
-                        match self.stream_handler.as_mut().unwrap().seek_by(duration) {
-                            Ok(_) => return true,
-                            Err(_) => return false,
-                        }
-                    }
-                }
-            }
-            None => return false,
-        }
+    fn seek(&mut self, duration: f64) -> RunStatus {
+        self.sender.send(PlayAction::Seek(duration)).unwrap();
+        info!("seeking by: {}", duration);
+        RunStatus::ok()
     }
 
-    /// Played duration over the the total duration of the song
-    /// format: full length / played duration
-    fn timer(&mut self) -> String {
-        match self.stream_handler.as_mut() {
-            Some(handler) => {
-                match handler.state() {
-                    PlaybackState::Stopping | PlaybackState::Stopped => {
-                        return format!("{:.2}/{:.2}", self.song_length, "0.0")
-                    },
+    async fn played_duration(&mut self) -> f32 {
+        #[cfg(feature = "full-log")]
+        info!("Requesting played duration from audio thread");
+        self.sender.send(PlayAction::GetPlayedDuration).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::PlayedDuration(duration) => return duration.as_secs_f32(),
                     _ => {
-                        return format!("{:.2}/{:.2}",self.song_length, handler.position())
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return Duration::ZERO.as_secs_f32();
                     }
+                },
+                None => {
+                    return Duration::ZERO.as_secs_f32();
                 }
-
-            },
-            None => {
-                return String::from("0.0/0.0");
-            },
-        }
-    }
-
-    /// Pauses playing the currently playing song, returns true if no panic happened
-    fn pause(&mut self) -> bool {
-        println!("pausing!");
-        if let Ok(_) = self.audio_manager.pause(Tween::default()) {
-            if let Ok(_) = self.stream_handler.as_mut().unwrap().pause(Tween::default()) {
-                return true
-
-            }else {
-                return false
             }
-        }
-        return false
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
     }
 
-    /// Resumes playing the currently paused song, returns true if no panic happened
-    fn resume(&mut self) -> bool {
-        println!("resuming");
-        if let Ok(_) = self.audio_manager.resume(Tween::default()) {
-            if let Ok(_) = self.stream_handler.as_mut().unwrap().resume(Tween::default()) {
-                return true;
-            }else {
-                return false;
-            }
-        }
-        return false
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn paused(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
+
+    async fn pause(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> RunStatus {
+        info!("Pausing");
+        self.sender.send(PlayAction::Pause).unwrap();
+        self.paused(emitter).await.unwrap();
+        RunStatus::ok()
     }
 
-    /// Terminate playing, returns true if no panic happened
-    fn end(&mut self) -> bool {
-        println!("stopping!");
-        let _ = match self.stream_handler.as_mut() {
-            Some(handler) => {
-                handler.stop(Tween::default())
-            },
-            None => return false,
-        };
-        true
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn resumed(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
+
+    async fn resume(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> RunStatus {
+        info!("resuming");
+        self.sender.send(PlayAction::Resume).unwrap();
+        self.resumed(emitter).await.unwrap();
+        RunStatus::ok()
     }
 
-    /// Plays the audio from the file path, returns true if no panic happened
-    fn play(&mut self, path: PathBuf) -> bool {
-        println!("Playing");
-        if path.is_dir() {
-            eprintln!("Expected a file path, got a directory!\ndirectory: {:?}", path);
-            return false 
-        }else {
-            self.path = path;
-        }
-        self.end();
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn ended(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
 
-        let mut start_time = self.clock.time();
-        self.clock.start().unwrap();
-        println!("song path: {:#?}", self.path);
-        let sound_data = StreamingSoundData::from_file(
-            self.path.clone(),
-            StreamingSoundSettings::default().start_time(start_time).volume(self.volume)
-        );
-        match sound_data {
-            Ok(sound_data) => {
-                self.song_length = sound_data.duration().as_secs_f64();
-                println!("song duration: {}", sound_data.duration().as_secs());
-                println!("volume: {}", self.volume);
-                start_time.ticks = start_time.ticks.checked_add(
-                    sound_data.duration().as_millis() as u64
-                ).unwrap();
-
-                self.stream_handler = Some(self.audio_manager.play(sound_data).unwrap());
-            },
-            _ => return false
-        };
-        true
+    async fn end(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> RunStatus {
+        info!("Stopping");
+        self.sender.send(PlayAction::Stop).unwrap();
+        self.ended(emitter).await.unwrap();
+        RunStatus::ok()
     }
 
-    /// Returns the player status:
-    /// - status: <Playing|Pausing|Paused|Stopping|Stopped>
-    /// - path: PATH
-    /// - volume: between 0 and 1
-    fn status(&self) -> String {
-        match self.stream_handler.as_ref() {
-            Some(handler) =>{
-                let state = handler.state();
-                format!("Status: {:#?}\nAudio Path: {:#?}\nVolume: {}", state, self.path, self.volume)
-            },
-            None => format!("Status: {:#?}\nAudio Path: {:#?}\nVolume: {}", PlaybackState::Stopped, self.path, self.volume),
-        }
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn music_played(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
+
+    async fn play_previous(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        info!("Playing previous music");
+        self.sender.send(PlayAction::PlayPreviousMusic).unwrap();
+        self.music_played(emitter).await.unwrap();
+        RunStatus::ok()
     }
 
-    /// gets the currently playing [Music]
-    pub async fn playing(&self) -> Music {
-        let path = self.path.clone().into();
-        let res = lofty::probe::Probe::open(&path);
-        match res {
-            Ok(probe)=>{
-                if let Ok(mut x) = probe.read() {
-                    let properties = x.properties();
-                    let length = properties.duration();
-                    if let Some(tag) = x.primary_tag_mut() {
-                        let title = tag.title().unwrap_or(std::borrow::Cow::from("Unknown")).to_string();
-                        let artist = tag.artist().unwrap_or(std::borrow::Cow::from("Unknown")).to_string();
-                        let genre = tag.genre().unwrap_or(std::borrow::Cow::from("Unknown")).to_string();
+    async fn play_next(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> RunStatus {
+        info!("Playing next music");
+        self.sender.send(PlayAction::PlayNextMusic).unwrap();
+        self.music_played(emitter).await.unwrap();
+        RunStatus::ok()
+    }
 
-                        return Music {
-                            title, length, path, artist, genre
-                        }
-                    }else {
-                        return Music {
-                            path, length,
-                            ..Default::default()
-                        }
+    async fn play_from_index(
+        &mut self,
+        index: u32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        info!("Playing from index {index}");
+        self.sender.send(PlayAction::PlayFromIndex(index)).unwrap();
+        self.music_played(emitter).await.unwrap();
+        RunStatus::ok()
+    }
+
+    async fn playlist(&mut self) -> Playlist {
+        info!("requesting playlist from audio thread");
+        self.sender
+            .send(PlayAction::GetPlaylist)
+            .unwrap_or_default();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Playlist(playlist) => return playlist,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return Playlist::default();
                     }
-                }else {
-                    println!("couldn't read the music prob in {:?}, falling to default method.", path);
-                    return Music::new(path)
+                },
+                None => {
+                    return Playlist::default();
                 }
-            },
-            Err(e) => {
-                println!("couldn't create the Music object from {:?}, returning the default object.", path);
-                println!("Error: {}", e);
-                return Music::new(path);
-            } 
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    async fn play(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> RunStatus {
+        let index = self.playlist.playing_index;
+        info!("Playing from index: {index}");
+        self.sender.send(PlayAction::PlayFromIndex(index)).unwrap();
+        self.resumed(emitter).await.unwrap();
+        RunStatus::ok()
+    }
+
+    async fn toggle_play(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        self.sender.send(PlayAction::TogglePlay).unwrap();
+        match self.get_playing_status().await {
+            PlayingStatus::Playing => self.music_played(emitter).await.unwrap(),
+            PlayingStatus::Pausing => self.paused(emitter).await.unwrap(),
+            _ => {}
         }
+        RunStatus::ok()
+    }
+
+    async fn toggle_mute(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        self.sender.send(PlayAction::ToggleMute).unwrap();
+        let volume = self.get_volume().await;
+        self.volume_changed(emitter, volume).await.unwrap();
+        RunStatus::ok()
+    }
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn sorted(&self, emitter: SignalEmitter<'_>, sort: Sort) -> zbus::Result<()>;
+
+    async fn sort(
+        &mut self,
+        sort: Sort,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        info!("Sorting playlist: {sort:?}");
+        self.sender.send(PlayAction::Sort(sort)).unwrap();
+        self.sorted(emitter, sort).await.unwrap();
+        RunStatus::ok()
+    }
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn repeat_changed(&self, emitter: SignalEmitter<'_>, sort: Repeat) -> zbus::Result<()>;
+
+    async fn repeat(
+        &mut self,
+        repeat: Repeat,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        info!("Changing repeat status: {repeat:?}");
+        self.sender.send(PlayAction::Repeat(repeat)).unwrap();
+        self.repeat_changed(emitter, repeat).await.unwrap();
+        RunStatus::ok()
+    }
+
+    async fn player_status(&mut self) -> PlayerStatus {
+        self.sender.send(PlayAction::GetPlayerStatus).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::PlayerStatus(music) => return music,
+                    _ => {
+                        info!("Got unexpected response");
+                        info!("Response: {:?}", data);
+                        return PlayerStatus::default();
+                    }
+                },
+                None => {
+                    return PlayerStatus::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    pub async fn playing(&mut self) -> Music {
+        info!("Requesting playing music from audio thread");
+        self.sender.send(PlayAction::GetPlayingMusic).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Music(music) => return music,
+                    _ => {
+                        info!("Got unexpected response");
+                        info!("Response: {:?}", data);
+                        return Music::default();
+                    }
+                },
+                None => {
+                    return Music::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    pub async fn lyrics(&mut self) -> Lyrics {
+        info!("Requesting music lyrics from audio thread");
+        self.sender.send(PlayAction::GetLyrics).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Lyrics(lyrics) => return lyrics,
+                    _ => {
+                        info!("Got unexpected response");
+                        info!("Response: {:?}", data);
+                        return Lyrics::default();
+                    }
+                },
+                None => {
+                    return Lyrics::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    pub async fn metadata(&mut self) -> Metadata {
+        info!("Requesting music metadata from audio thread");
+        self.sender.send(PlayAction::GetMetadata).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Metadata(metadata) => return metadata,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return Metadata::default();
+                    }
+                },
+                None => {
+                    return Metadata::default();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    async fn timer(&mut self) -> (f32, f32) {
+        info!("Requesting timer from audio thread");
+        self.sender.send(PlayAction::GetTimer).unwrap();
+
+        #[cfg(feature = "full-log")]
+        info!("Waiting for response...");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Timer(metadata) => return metadata,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return (0.0, 0.0);
+                    }
+                },
+                None => {
+                    return (0.0, 0.0);
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
     }
 }
 
 pub struct Server {
     dbus_addr: String,
     dbus_interf: String,
-    done: Event,
+    // reciver: UnboundedReceiver<PlayAction>,
     player: Player,
     #[allow(dead_code)]
     app_name: String,
 }
-
 
 #[allow(dead_code)]
 fn path_from_addr(addr: &String) -> String {
@@ -426,66 +1146,731 @@ fn path_from_addr(addr: &String) -> String {
 }
 
 impl Server {
+    #[allow(unused)]
+    pub fn start_tracing(self) -> Self {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::DEBUG)
+            .with_line_number(true)
+            .with_ansi(true)
+            // completes the builder.
+            .finish();
+
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+
+        self
+    }
+
     #[allow(dead_code)]
     /// screates a new server and connect it to the specified
     /// dbus address
-    pub fn new(dbus_addr: String) -> Self {
-        let mut manager = AudioManager::<DefaultBackend>::new(
-                    AudioManagerSettings::default()
-                    ).unwrap();
-        let clock =  manager.add_clock(
-                    ClockSpeed::TicksPerSecond(1000.0)
-                    ).unwrap();
-        Server { 
+    pub async fn new(dbus_addr: String) -> Self {
+        let config = Config::read_config(PathBuf::new()).unwrap_or_default();
+        let playlist = Playlist::from_config(&config);
+
+        let (sender, reciver) = tokio::sync::mpsc::unbounded_channel::<PlayAction>();
+
+        let (response_sender, response_reciver) =
+            tokio::sync::mpsc::unbounded_channel::<Response>();
+        let sender_clone_2 = sender.clone();
+
+        AudioThread::new(&config, sender_clone_2, reciver, response_sender)
+            .spawn_thread()
+            .await;
+
+        Server {
             dbus_interf: path_from_addr(&dbus_addr),
             dbus_addr,
             app_name: String::from("mplayer"),
-            done: event_listener::Event::new(),
             player: Player {
-                path: PathBuf::default(),
-                audio_manager: manager,
-                stream_handler: None,
-                volume: 0.5,
-                muted_volume: 0.0,
-                muted_state: MutedState::UnMuted,
-                song_length: 0.0,
-                clock,
-            }
+                response_reciver,
+                sender,
+                playlist,
+            },
         }
     }
 
-    pub fn default() -> Self {
-        let mut manager = AudioManager::<DefaultBackend>::new(
-            AudioManagerSettings::default()
-        ).unwrap();
-        let clock = manager.add_clock(ClockSpeed::TicksPerSecond(1000.0)).unwrap();
+    #[instrument(name = "AudioThread", skip_all)]
+    pub async fn default() -> Self {
+        let config = Config::try_from_env().unwrap_or_default();
+        let playlist = Playlist::from_config(&config);
+
+        let (sender, reciver) = tokio::sync::mpsc::unbounded_channel::<PlayAction>();
+        let (response_sender, response_reciver) =
+            tokio::sync::mpsc::unbounded_channel::<Response>();
+        let sender_clone_2 = sender.clone();
+
+        AudioThread::new(&config, sender_clone_2, reciver, response_sender)
+            .spawn_thread()
+            .await;
+
         Server {
             dbus_addr: String::from("org.zbus.mplayer"),
             dbus_interf: String::from("/org/zbus/mplayer"),
             app_name: String::from("mplayer"),
-            done: event_listener::Event::new(),
             player: Player {
-                path: PathBuf::default(),
-                audio_manager: manager,
-                stream_handler: None,
-                volume: 0.5,
-                muted_volume: 0.0,
-                muted_state: MutedState::UnMuted,
-                song_length: 0.0,
-                clock,
-            }
+                response_reciver,
+                sender,
+                playlist,
+            },
         }
     }
 
     /// Starts the dbus server
     pub async fn start(self) -> Result<(), Box<dyn Error>> {
-        let done_listener = self.done.listen();
+        info!("Starting the `mplayer-server`...");
         let _connection = connection::Builder::session()?
             .name(self.dbus_addr.clone())?
+            .max_queued(1000)
             .serve_at(self.dbus_interf.clone(), self.player)?
             .build()
             .await?;
-        done_listener.wait();
+
+        tokio::signal::ctrl_c().await?;
         Ok(())
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default, zbus::zvariant::Type)]
+pub enum PlayingStatus {
+    Playing,
+    Pausing,
+    #[default]
+    Stopped,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, zbus::zvariant::Type)]
+pub struct PlayerStatus {
+    status: PlayingStatus,
+    music: Music,
+    /// between 0 and 1
+    volume: f32,
+    index: u32,
+}
+impl PlayerStatus {
+    pub fn new(status: PlayingStatus, music: Music, volume: f32, index: u32) -> Self {
+        Self {
+            status,
+            music,
+            volume,
+            index,
+        }
+    }
+}
+
+impl Default for PlayerStatus {
+    fn default() -> Self {
+        PlayerStatus {
+            status: PlayingStatus::default(),
+            music: Music::default(),
+            volume: 0.0,
+            index: 0,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, zbus::zvariant::Type)]
+struct Playlist {
+    musics: Vec<Music>,
+    sort: Sort,
+    repeat: Repeat,
+    playing_index: u32,
+}
+
+macro_rules! ternary {
+    ($c:expr, $v:expr) => {
+        if $c {
+            $v
+        }
+    };
+}
+
+// TODO: check if playlist is already sorted by the element requested, if so, don't resort
+impl Playlist {
+    fn sort(&mut self, sort: Sort) {
+        let mut seed = rand::rng();
+        ternary!(
+            matches!(sort, Sort::Shuffle),
+            self.musics.shuffle(&mut seed)
+        );
+        self.musics
+            .sort_by(|thing, other| thing.compare_by(sort, other));
+        self.sort = sort;
+    }
+
+    #[instrument(name = "asafadsdf", skip_all)]
+    fn visit_dirs(path: &PathBuf, _cfg: &Config) -> Self {
+        let mut musics = vec![];
+        if path.is_dir() {
+            std::fs::read_dir(path).unwrap().for_each(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    Self::visit_dirs(&path, _cfg)
+                        .musics
+                        .iter()
+                        .for_each(|music| {
+                            musics.push(Music::from_path(music.path.clone().into()));
+                        });
+                } else {
+                    // FIXME: if let chain
+                    if let Some(extensions) = &_cfg.allow_formats {
+                        if let Some(extension) = path.extension() {
+                            if extensions.iter().any(|v| {
+                                extension
+                                    .to_str()
+                                    .unwrap()
+                                    .to_lowercase()
+                                    .eq(&v.to_str().to_lowercase())
+                            }) {
+                                musics.push(Music::from_path(path));
+                            } else {
+                                #[cfg(feature = "full-log")]
+                                info!("EXCLUDED PATH: {:#?}", path);
+                            }
+                        }
+                    } else {
+                        musics.push(Music::from_path(path));
+                    }
+                }
+            });
+        }
+
+        Self {
+            musics,
+            playing_index: u32::default(),
+            sort: Sort::default(),
+            repeat: Repeat::default(),
+        }
+    }
+
+    fn from_config(cfg: &Config) -> Self {
+        let mut playlist = Self::visit_dirs(&PathBuf::from_str(&cfg.path).unwrap(), cfg);
+        playlist.sort(cfg.sort);
+        playlist
+    }
+
+    fn reload_from_config(&mut self, cfg: &Config) {
+        let mut playlist = Self::visit_dirs(&PathBuf::from_str(&cfg.path).unwrap(), cfg);
+        playlist.sort(cfg.sort);
+        *self = playlist;
+    }
+
+    fn next_music(&mut self) -> Option<Music> {
+        let next_index = self.next_music_index();
+        let music: Music = self.musics.get(next_index as usize).unwrap().to_owned();
+        #[cfg(feature = "full-log")]
+        info!("MUSIC: {:#?}", music);
+        Some(music)
+    }
+
+    fn next_music_index(&mut self) -> u32 {
+        let index = self.playing_index;
+        let size = self.musics.len() as u32;
+        if index + 1 >= size {
+            return 0;
+        } else {
+            return index + 1;
+        }
+    }
+
+    fn previous_music(&mut self) -> Option<Music> {
+        let prev_indx = self.previous_music_index();
+        let music: Music = self.musics.get(prev_indx as usize).unwrap().to_owned();
+        #[cfg(feature = "full-log")]
+        info!("MUSIC: {:#?}", music);
+        Some(music)
+    }
+
+    fn previous_music_index(&mut self) -> u32 {
+        let index = self.playing_index;
+        let size = self.musics.len();
+        if index == 0 {
+            return size as u32 - 1;
+        } else {
+            return index - 1;
+        }
+    }
+
+    fn repeat(&mut self, repeat: Repeat) {
+        self.repeat = repeat;
+    }
+
+    fn playing_music(&self) -> Music {
+        let index = self.playing_index;
+        #[cfg(feature = "full-log")]
+        info!("Getting music with index {index}");
+        match self.musics.get(index as usize) {
+            Some(music) => {
+                return music.to_owned();
+            }
+            None => {
+                error!("No playing index, playing index is set to `None`");
+                return Music::default();
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+enum FileFormat {
+    #[serde(alias = "ogg", alias = "OGG")]
+    Ogg,
+    #[serde(alias = "mp3", alias = "MP3")]
+    Mp3,
+    #[serde(alias = "flac", alias = "FLAC")]
+    Flac,
+    #[serde(alias = "webm", alias = "WEBM")]
+    Webm,
+}
+
+impl FileFormat {
+    fn to_str(&self) -> &'static str {
+        match self {
+            FileFormat::Ogg => "Ogg",
+            FileFormat::Mp3 => "Mp3",
+            FileFormat::Flac => "Flac",
+            FileFormat::Webm => "Webm",
+        }
+    }
+}
+
+impl ToString for FileFormat {
+    fn to_string(&self) -> String {
+        format!("{:?}", self)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct Config {
+    path: String,
+    sort: Sort,
+    repeat: Repeat,
+    volume: f32,
+    allow_formats: Option<Vec<FileFormat>>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            path: String::default(),
+            sort: Sort::default(),
+            repeat: Repeat::default(),
+            volume: 0.5,
+            allow_formats: Some(vec![FileFormat::Ogg, FileFormat::Flac, FileFormat::Mp3]),
+        }
+    }
+}
+
+impl Config {
+    // TODO: redesign this to return a Result<Self> instead of failing immediately
+    fn read_config(path: PathBuf) -> std::io::Result<Self> {
+        let conf_content = std::fs::read_to_string(&path)?;
+        toml::from_str::<Self>(&conf_content).map_err(|e| {
+            std::io::Error::other(format!(
+                "Couldn't parse config from path '{:?}', aborting...\nError{e}",
+                path
+            ))
+        })
+    }
+
+    /// Tries to construct [Config] from the passed param or checks default
+    /// path, and errors if neither works
+    fn try_from_env() -> std::io::Result<Self> {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() > 1 {
+            Config::read_config(PathBuf::from(&args[1]))
+        } else {
+            let mut home = std::env::var("HOME").unwrap().to_string();
+            home.push_str("/.config/mplayer-server/config.toml");
+            let file_path = PathBuf::from_str(&home).unwrap_or_default();
+            if file_path.exists() {
+                Config::read_config(file_path)
+            } else {
+                Err(std::io::Error::other(
+                    "Couldn't load config from environement",
+                ))
+            }
+        }
+    }
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default, zbus::zvariant::Type,
+)]
+enum Sort {
+    #[default]
+    ByTitleAscending,
+    ByTitleDescending,
+    ByDurationAscending,
+    ByDurationDescending,
+    ArtistAscending,
+    ArtistDescending,
+    Shuffle,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default, zbus::zvariant::Type,
+)]
+pub enum Repeat {
+    /// repeat the currently playing music
+    SameMusic,
+    #[default]
+    /// cyclye through all the playlist
+    AllMusics,
+    /// stop after the currently playing music
+    Dont,
+}
+
+#[derive(Default)]
+struct Extra {
+    muted_volume: f32,
+}
+
+impl Extra {
+    fn muted_volume(mut self, volume: f32) -> Self {
+        self.muted_volume = volume;
+        self
+    }
+
+    fn set_muted_volume(&mut self, volume: f32) {
+        self.muted_volume = volume;
+    }
+}
+
+#[allow(dead_code)]
+struct AudioThread {
+    sink: Sink,
+    stream_handle: rodio::OutputStream,
+    playlist: Playlist,
+    action_sender: UnboundedSender<PlayAction>,
+    action_reciver: UnboundedReceiver<PlayAction>,
+    data_sender: UnboundedSender<Response>,
+    extra: Extra,
+}
+
+unsafe impl std::marker::Send for AudioThread {}
+
+impl AudioThread {
+    pub fn new(
+        config: &Config,
+        action_sender: UnboundedSender<PlayAction>,
+        action_reciver: UnboundedReceiver<PlayAction>,
+        data_sender: UnboundedSender<Response>,
+    ) -> Self {
+        let stream_handle = rodio::OutputStreamBuilder::open_default_stream().unwrap();
+        let sink = rodio::Sink::connect_new(&stream_handle.mixer());
+        sink.set_volume(config.volume);
+        let extra = Extra::default().muted_volume(config.volume);
+        let playlist = Playlist::from_config(&config);
+        Self {
+            action_sender,
+            action_reciver,
+            stream_handle,
+            sink,
+            playlist,
+            data_sender,
+            extra,
+        }
+    }
+
+    pub async fn spawn_thread(self) {
+        tokio::spawn(async move {
+            self.audio_thread().await;
+        });
+    }
+
+    #[allow(unreachable_code)]
+    #[instrument(name = "AudioThread", skip_all)]
+    pub async fn audio_thread(mut self) {
+        loop {
+            if let Some(data) = self.action_reciver.recv().await {
+                match data {
+                    PlayAction::PlayFromIndex(index) => {
+                        // TODO: what if this fail
+                        // FIXME
+                        self.playlist.playing_index = index;
+                        let music = self.playlist.musics.get(index as usize).unwrap();
+
+                        info!("playing music : {}", music);
+                        self.sink.clear();
+                        self.sink.append(
+                            rodio::Decoder::try_from(
+                                std::fs::File::open(PathBuf::from(music.path.clone())).unwrap(),
+                            )
+                            .unwrap(),
+                        );
+                        let thing = self.action_sender.clone();
+                        self.sink
+                            .append(rodio::source::EmptyCallback::new(Box::new(move || {
+                                thing.send(PlayAction::Ended).unwrap();
+                            })));
+                        self.sink.play();
+                    }
+                    PlayAction::TogglePlay => {
+                        if self.sink.is_paused() {
+                            self.sink.play();
+                        } else {
+                            self.sink.pause();
+                        }
+                    }
+                    PlayAction::Ended => match self.playlist.repeat {
+                        // NOTE: using rt because we hit a `no reactor running` error
+                        // NOTE: using light client because we want to send signals for
+                        // the new playing music
+                        Repeat::SameMusic => {
+                            let index = self.playlist.playing_index;
+                            let conn = Connection::session().await.unwrap_or_else(|_| {
+                                panic!("Could not connect to the bus address, aborting...");
+                            });
+                            let proxy = LightClientProxy::new(&conn).await.unwrap();
+                            proxy.play_from_index(index).await.unwrap();
+                            conn.close().await.unwrap();
+                        }
+                        Repeat::AllMusics => {
+                            let conn = Connection::session().await.unwrap_or_else(|_| {
+                                panic!("Could not connect to the bus address, aborting...");
+                            });
+                            let proxy = LightClientProxy::new(&conn).await.unwrap();
+                            proxy.play_next().await.unwrap();
+                            conn.close().await.unwrap();
+                            #[cfg(feature = "full-log")]
+                            info!("Playing next music");
+                        }
+                        Repeat::Dont => {}
+                    },
+                    PlayAction::Stop => {
+                        self.sink.stop();
+                    }
+                    PlayAction::Quit => {
+                        self.sink.stop();
+                    }
+                    PlayAction::Pause => {
+                        self.sink.pause();
+                    }
+                    PlayAction::Resume => {
+                        self.sink.play();
+                    }
+                    PlayAction::PlayNextMusic => {
+                        let next_index = self.playlist.next_music_index();
+                        self.action_sender
+                            .send(PlayAction::PlayFromIndex(next_index))
+                            .unwrap();
+                    }
+                    PlayAction::PlayPreviousMusic => {
+                        let previous_index = self.playlist.previous_music_index();
+                        self.action_sender
+                            .send(PlayAction::PlayFromIndex(previous_index))
+                            .unwrap();
+                    }
+                    PlayAction::Seek(duration) => {
+                        let duration = Duration::from_secs_f64(duration);
+                        self.sink.try_seek(duration).unwrap();
+                    }
+                    PlayAction::Repeat(repeat) => {
+                        info!("Repeat: {repeat:?}");
+                        self.playlist.repeat(repeat);
+                    }
+                    PlayAction::Sort(sort) => {
+                        info!("Sort: {sort:?}");
+                        self.playlist.sort(sort);
+                    }
+                    PlayAction::Volume(volume) => {
+                        self.sink.set_volume(volume);
+                    }
+                    PlayAction::GetPlaylist => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived playlist request");
+                        let playlist = self.playlist.clone();
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending playitst to requester");
+                        self.data_sender.send(Response::Playlist(playlist)).unwrap();
+                    }
+                    PlayAction::GetPlaying | PlayAction::GetPlayingMusic => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived music info request");
+                        let music = self.playlist.playing_music();
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending music info to requester");
+                        self.data_sender.send(Response::Music(music)).unwrap();
+                    }
+                    PlayAction::GetPlayingIndex => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived playing index request");
+                        let index = self.playlist.playing_index;
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending playing index requester");
+                        self.data_sender
+                            .send(Response::PlayingIndex(index))
+                            .unwrap();
+                    }
+                    PlayAction::GetRepeat => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived repeat state request");
+                        let repeat = self.playlist.repeat;
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending repeat state requester");
+                        self.data_sender.send(Response::Repeat(repeat)).unwrap();
+                    }
+                    PlayAction::GetSort => {
+                        info!("Recived sorting state request");
+                        let sort = self.playlist.sort;
+                        info!("Sending sorting state requester");
+                        self.data_sender.send(Response::Sort(sort)).unwrap();
+                    }
+                    PlayAction::GetMetadata => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived sorting state request");
+                        let metadata = self.playlist.playing_music().extract_matadata();
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending sorting state requester");
+                        self.data_sender.send(Response::Metadata(metadata)).unwrap();
+                    }
+                    PlayAction::GetLyrics => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived Lyrics request");
+                        let lyrics = self
+                            .playlist
+                            .playing_music()
+                            .extract_lyrics()
+                            .unwrap_or_default();
+
+                        #[cfg(feature = "full-log")]
+                        {
+                            info!("Sending lyrics to requester");
+                            info!("{lyrics}");
+                        }
+                        self.data_sender.send(Response::Lyrics(lyrics)).unwrap();
+                    }
+                    PlayAction::GetPlayedDuration => {
+                        #[cfg(all(feature = "full-log", feature = "trivial"))]
+                        info!("Recived played duration request");
+
+                        let duration = self.sink.get_pos();
+                        #[cfg(all(feature = "full-log", feature = "trivial"))]
+                        info!("Sending played duration: {duration:?}");
+                        self.data_sender
+                            .send(Response::PlayedDuration(duration))
+                            .unwrap();
+                    }
+                    PlayAction::GetVolume => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived volume info request");
+                        let volume = self.sink.volume();
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending volume info: {volume:?}");
+                        self.data_sender.send(Response::Volume(volume)).unwrap();
+                    }
+                    PlayAction::GetPreviousMusic => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived previous music info request");
+                        let music = self.playlist.previous_music().unwrap_or_default();
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending previous music info: {music:?}");
+                        self.data_sender
+                            .send(Response::PreviousMusic(music))
+                            .unwrap();
+                    }
+                    PlayAction::GetNextMusic => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived next music info request");
+
+                        let music = self.playlist.next_music().unwrap_or_default();
+                        #[cfg(feature = "full-log")]
+                        info!("Sending next music info: {music:?}");
+                        self.data_sender.send(Response::NextMusic(music)).unwrap();
+                    }
+                    PlayAction::GetPlayingStatus => {
+                        let paused = self.sink.is_paused();
+                        let emtpy = self.sink.empty();
+                        if paused && emtpy {
+                            self.data_sender
+                                .send(Response::PlayingStatus(PlayingStatus::Stopped))
+                                .unwrap();
+                        } else if paused && !emtpy {
+                            self.data_sender
+                                .send(Response::PlayingStatus(PlayingStatus::Pausing))
+                                .unwrap();
+                        } else if !paused && !emtpy {
+                            self.data_sender
+                                .send(Response::PlayingStatus(PlayingStatus::Playing))
+                                .unwrap();
+                        }
+                    }
+                    PlayAction::GetIndex => {
+                        #[cfg(feature = "full-log")]
+                        info!("Recived playing index request");
+                        let index = self.playlist.playing_index;
+
+                        #[cfg(feature = "full-log")]
+                        info!("Sending playing index: {index}");
+                        self.data_sender
+                            .send(Response::PlayingIndex(index))
+                            .unwrap();
+                    }
+                    PlayAction::GetTimer => {
+                        #[cfg(all(feature = "full-log", feature = "trivial"))]
+                        info!("Recived timer request");
+                        let timer = (
+                            self.sink.get_pos().as_secs_f32(),
+                            self.playlist.playing_music().length.as_secs_f32(),
+                        );
+                        #[cfg(all(feature = "full-log", feature = "trivial"))]
+                        info!("Sending timer info");
+                        self.data_sender.send(Response::Timer(timer)).unwrap();
+                    }
+                    PlayAction::GetPlayerStatus => {
+                        // FIXME
+                        let music = self.playlist.playing_music();
+                        let volume = self.sink.volume();
+                        let index = self.playlist.playing_index;
+                        let status = self.sink.status();
+                        let player_status = PlayerStatus::new(status, music, volume, index);
+                        self.data_sender
+                            .send(Response::PlayerStatus(player_status))
+                            .unwrap();
+                    }
+                    PlayAction::ReloadConfig(config) => {
+                        self.playlist.reload_from_config(&config);
+                    }
+                    PlayAction::ToggleMute => {
+                        if self.sink.volume().ne(&0.0) {
+                            self.extra.set_muted_volume(self.sink.volume());
+                            self.sink.set_volume(0.0);
+                        } else {
+                            self.sink.set_volume(self.extra.muted_volume);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+trait SinkAddons {
+    fn status(&self) -> PlayingStatus;
+}
+
+impl SinkAddons for Sink {
+    fn status(&self) -> PlayingStatus {
+        let paused = self.is_paused();
+        let emtpy = self.empty();
+        if paused && emtpy {
+            return PlayingStatus::Stopped;
+        } else if paused && !emtpy {
+            return PlayingStatus::Pausing;
+        } else if !paused && !emtpy {
+            return PlayingStatus::Playing;
+        } else {
+            return PlayingStatus::Stopped;
+        }
     }
 }
