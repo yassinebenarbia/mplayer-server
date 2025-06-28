@@ -663,39 +663,6 @@ impl<'a> Player {
         .unwrap_or_default()
     }
   
-    /// Returns current audio [Metadata]
-    fn metadata(&mut self) -> Metadata {
-        println!("reading data from file...");
-        match audiotags::Tag::new().read_from_path(self.path.clone()) {
-            Ok(tag) => {
-                println!("extracting data from file...");
-                let genre: String = tag.genre().unwrap_or("Unknown").to_string().replace('\0', "");
-                let title: String = tag.title().unwrap_or("Unknown").to_string().replace('\0', "");
-                let artist: String = tag.artist().unwrap_or("Unknown").to_string().replace('\0', "");
-                println!("crating album cover...");
-                let cover = tag.album_cover().unwrap_or(audiotags::Picture{
-                    mime_type: audiotags::MimeType::Jpeg,
-                    data: &[0]
-                }).clone();
-                println!("getting cover data..");
-                let tp: audiotags::MimeType = cover.mime_type; 
-                let data: Vec<u8> = cover.data.to_owned();
-
-                Metadata {
-                    title,
-                    artist,
-                    genre,
-                    cover: Picture {
-                        data,
-                        tp: ImageType(tp)
-                    },
-                }
-            }
-        })
-        .await
-        .unwrap_or_default()
-    }
-
     async fn get_repeat(&mut self) -> Repeat {
         info!("Requesting repeat status status");
         self.sender.send(PlayAction::GetRepeat).unwrap();
