@@ -1,6 +1,9 @@
 // TODO: add tests for sorting and stuff
 // TODO: support connection over over http
 // TODO: handle the unwrap calls (this is a mess)
+// TODO: make main playlist name modifiable ("default")
+// TODO: fix bug when you press play on an empty playlist it craches
+// TODO: write a fuzz testing script
 use lofty::{
     self,
     file::{AudioFile, TaggedFileExt},
@@ -10,9 +13,9 @@ use lofty::{
 use rand::seq::SliceRandom;
 use regex::Regex;
 use rodio::Sink;
-use serde::{ser::Serializer, Deserializer};
+use serde::{ser::Serializer, Deserialize, Deserializer, Serialize};
 use std::{
-    borrow::Cow, error::Error, fmt::Display, io::BufReader, path::PathBuf, str::FromStr,
+    borrow::Cow, collections::HashMap, error::Error, fmt::Display, path::PathBuf, str::FromStr,
     time::Duration,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -20,7 +23,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 use zbus::{connection, interface, object_server::SignalEmitter, zvariant::FilePath, Connection};
 
-use crate::{instrument, light_client::LightClientProxy};
+use crate::{instrument, light_client::LightClientProxy, utils::log};
 
 #[derive(
     PartialEq,
@@ -117,6 +120,16 @@ enum PlayAction {
     GetPlayerStatus,
     ReloadConfig(Config),
     ToggleMute,
+    AddToPlaylist(usize, String, String),
+    DeleteFromPlaylist(usize, String),
+    LoadPlaylist(String),
+    DeletePlaylist(String),
+    CreatePlaylist(String),
+    GetPlaylists,
+    GetPlaylistName,
+    Play,
+    RenamePlaylist(String, String),
+    RemovePlaylist(String),
 }
 
 #[derive(
@@ -559,8 +572,17 @@ impl Default for Metadata {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
+pub enum PlaylistOpperation {
+    AddedMusic,
+    DeletedMusic,
+    PlaylistRenamed,
+    PlaylistRemoved,
+}
+
 #[derive(Clone, Debug)]
 enum Response {
+    PlaylistName(String),
     Timer((f32, f32)),
     Music(Music),
     Playlist(Playlist),
@@ -575,20 +597,21 @@ enum Response {
     NextMusic(Music),
     PlayingStatus(PlayingStatus),
     PlayerStatus(PlayerStatus),
+    Playlists(HashMap<String, Playlist>),
 }
 
 struct Player {
     // controller: awedio::backends::CpalBackend,
     sender: UnboundedSender<PlayAction>,
-    playlist: Playlist,
+    // playlist: Playlist,
     response_reciver: UnboundedReceiver<Response>,
 }
 
+// methods
 #[interface(name = "org.zbus.mplayerServer")]
 impl<'a> Player {
     async fn reload_config(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
         let config = Config::try_from_env().unwrap_or_default();
-        self.playlist.reload_from_config(&config);
         // ---------------------------------------------------------------
         self.sender.send(PlayAction::ReloadConfig(config)).unwrap();
         self.config_reloaded(emitter).await.unwrap();
@@ -601,6 +624,29 @@ impl<'a> Player {
     #[zbus(signal)]
     #[allow(unused)]
     async fn config_reloaded(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn playlists_updated(
+        &self,
+        emitter: SignalEmitter<'_>,
+        opperatioin: PlaylistOpperation,
+        id: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn playlist_loaded(&self, emitter: &SignalEmitter<'_>, id: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn playlist_deleted(&mut self, emitter: &SignalEmitter<'_>, id: &str)
+        -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    #[allow(unused)]
+    async fn playlist_created(&mut self, emitter: &SignalEmitter<'_>, id: &str)
+        -> zbus::Result<()>;
 
     async fn volume(
         &mut self,
@@ -662,7 +708,7 @@ impl<'a> Player {
         .await
         .unwrap_or_default()
     }
-  
+
     async fn get_repeat(&mut self) -> Repeat {
         info!("Requesting repeat status status");
         self.sender.send(PlayAction::GetRepeat).unwrap();
@@ -907,9 +953,9 @@ impl<'a> Player {
     }
 
     async fn play(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> RunStatus {
-        let index = self.playlist.playing_index;
-        info!("Playing from index: {index}");
-        self.sender.send(PlayAction::PlayFromIndex(index)).unwrap();
+        // let index = self.playlist.playing_index;
+        // info!("Playing from index: {index}");
+        self.sender.send(PlayAction::Play).unwrap();
         self.resumed(emitter).await.unwrap();
         RunStatus::ok()
     }
@@ -1094,6 +1140,178 @@ impl<'a> Player {
         .unwrap_or_default()
         .to_owned()
     }
+
+    async fn remove_playlist(
+        &mut self,
+        name: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        self.sender
+            .send(PlayAction::RemovePlaylist(name.clone()))
+            .unwrap();
+
+        self.playlists_updated(emitter, PlaylistOpperation::PlaylistRemoved, &name)
+            .await
+            .unwrap();
+
+        RunStatus::ok()
+    }
+
+    async fn rename_playlist(
+        &mut self,
+        old: String,
+        new: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        self.sender
+            .send(PlayAction::RenamePlaylist(old.clone(), new))
+            .unwrap();
+
+        self.playlists_updated(emitter, PlaylistOpperation::PlaylistRenamed, &old)
+            .await
+            .unwrap();
+
+        RunStatus::ok()
+    }
+
+    // TODO: rename this to `update_playlist`
+    async fn save_to_playlist(
+        &mut self,
+        index: usize,
+        source: String,
+        destination: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        // this is an action to the player thread to be as close as possible
+        // to the playing song(s) in case the current self.musics and the "real"
+        // playlist are out of sinc somehow.
+        self.sender
+            .send(PlayAction::AddToPlaylist(
+                index,
+                source,
+                destination.clone(),
+            ))
+            .unwrap();
+
+        self.playlists_updated(emitter, PlaylistOpperation::AddedMusic, &destination)
+            .await
+            .unwrap();
+        RunStatus::ok()
+    }
+
+    async fn delete_from_playlist(
+        &mut self,
+        index: usize,
+        id: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
+        // this is an action to the player thread to be as close as possible
+        // to the playing song(s) in case the current self.musics and the "real"
+        // playlist are out of sinc somehow.
+        self.sender
+            .send(PlayAction::DeleteFromPlaylist(index, id.clone()))
+            .unwrap();
+
+        self.playlists_updated(emitter, PlaylistOpperation::DeletedMusic, &id)
+            .await
+            .unwrap();
+    }
+
+    async fn delete_playlist(
+        &mut self,
+        id: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
+        // this is an action to the player thread to be as close as possible
+        // to the playing song(s) in case the current self.musics and the "real"
+        // playlist are out of sinc somehow.
+        self.sender
+            .send(PlayAction::DeletePlaylist(id.clone()))
+            .unwrap();
+        self.playlist_deleted(&emitter, &id).await.unwrap();
+    }
+
+    async fn use_playlist(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: String,
+    ) {
+        self.sender
+            .send(PlayAction::LoadPlaylist(id.clone()))
+            .unwrap();
+        self.sender.send(PlayAction::Stop).unwrap();
+        self.playlist_loaded(&emitter, id.as_str()).await.unwrap();
+    }
+
+    async fn create_playlist(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: String,
+    ) {
+        self.sender
+            .send(PlayAction::CreatePlaylist(id.clone()))
+            .unwrap();
+        self.playlist_created(&emitter, id.as_str()).await.unwrap();
+    }
+
+    async fn get_playlists_names(&mut self) -> Vec<String> {
+        let mut playlist = self
+            .get_playlists()
+            .await
+            .keys()
+            .map(|v| v.to_owned())
+            .collect::<Vec<String>>();
+        playlist.sort();
+        playlist
+    }
+
+    async fn get_playlist_name(&mut self) -> String {
+        self.sender.send(PlayAction::GetPlaylistName).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::PlaylistName(name) => return name,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return String::new();
+                    }
+                },
+                None => {
+                    return String::new();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
+
+    async fn get_playlists(&mut self) -> HashMap<String, Playlist> {
+        self.sender.send(PlayAction::GetPlaylists).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(data) => match data {
+                    Response::Playlists(playlists) => return playlists,
+                    _ => {
+                        error!("Got unexpected response");
+                        #[cfg(feature = "full-log")]
+                        error!(response=?data);
+                        return HashMap::new();
+                    }
+                },
+                None => {
+                    return HashMap::new();
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+        .to_owned()
+    }
 }
 
 pub struct Server {
@@ -1132,6 +1350,7 @@ impl Server {
     /// screates a new server and connect it to the specified
     /// dbus address
     pub async fn new(dbus_addr: String) -> Self {
+        // init
         let config = Config::read_config(PathBuf::new()).unwrap_or_default();
         let playlist = Playlist::from_config(&config);
 
@@ -1152,7 +1371,7 @@ impl Server {
             player: Player {
                 response_reciver,
                 sender,
-                playlist,
+                // playlist,
             },
         }
     }
@@ -1178,7 +1397,7 @@ impl Server {
             player: Player {
                 response_reciver,
                 sender,
-                playlist,
+                // playlist,
             },
         }
     }
@@ -1243,6 +1462,7 @@ struct Playlist {
     sort: Sort,
     repeat: Repeat,
     playing_index: u32,
+    name: String,
 }
 
 macro_rules! ternary {
@@ -1251,6 +1471,12 @@ macro_rules! ternary {
             $v
         }
     };
+}
+
+#[derive(Deserialize, Serialize)]
+struct PlaylistEntry {
+    key: String,
+    value: Vec<Music>,
 }
 
 // TODO: check if playlist is already sorted by the element requested, if so, don't resort
@@ -1266,7 +1492,7 @@ impl Playlist {
         self.sort = sort;
     }
 
-    #[instrument(name = "asafadsdf", skip_all)]
+    #[instrument(skip_all)]
     fn visit_dirs(path: &PathBuf, _cfg: &Config) -> Self {
         let mut musics = vec![];
         if path.is_dir() {
@@ -1309,12 +1535,17 @@ impl Playlist {
             playing_index: u32::default(),
             sort: Sort::default(),
             repeat: Repeat::default(),
+            name: String::default(),
         }
     }
 
     fn from_config(cfg: &Config) -> Self {
         let mut playlist = Self::visit_dirs(&PathBuf::from_str(&cfg.path).unwrap(), cfg);
         playlist.sort(cfg.sort);
+        playlist.name = String::from("default");
+        playlist
+            .save(&PathBuf::from_str(&cfg.playlist_save_path).unwrap())
+            .unwrap();
         playlist
     }
 
@@ -1378,6 +1609,19 @@ impl Playlist {
             }
         }
     }
+
+    fn save(&mut self, path: &PathBuf) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(path).unwrap();
+        let mut map = serde_json::from_str::<HashMap<&str, Playlist>>(&content).unwrap_or_default();
+        map.insert(&self.name, self.to_owned());
+
+        std::fs::write(path, serde_json::to_string_pretty(&map).unwrap()).unwrap();
+        Ok(())
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1416,6 +1660,7 @@ struct Config {
     repeat: Repeat,
     volume: f32,
     allow_formats: Option<Vec<FileFormat>>,
+    playlist_save_path: String,
 }
 
 impl Default for Config {
@@ -1426,6 +1671,8 @@ impl Default for Config {
             repeat: Repeat::default(),
             volume: 0.5,
             allow_formats: Some(vec![FileFormat::Ogg, FileFormat::Flac, FileFormat::Mp3]),
+            // FIXME
+            playlist_save_path: String::default(),
         }
     }
 }
@@ -1515,6 +1762,7 @@ struct AudioThread {
     action_reciver: UnboundedReceiver<PlayAction>,
     data_sender: UnboundedSender<Response>,
     extra: Extra,
+    playlist_save_path: String,
 }
 
 unsafe impl std::marker::Send for AudioThread {}
@@ -1530,6 +1778,7 @@ impl AudioThread {
         let sink = rodio::Sink::connect_new(&stream_handle.mixer());
         sink.set_volume(config.volume);
         let extra = Extra::default().muted_volume(config.volume);
+        let playlist_save_path = config.playlist_save_path.clone();
         let playlist = Playlist::from_config(&config);
         Self {
             action_sender,
@@ -1537,6 +1786,7 @@ impl AudioThread {
             stream_handle,
             sink,
             playlist,
+            playlist_save_path,
             data_sender,
             extra,
         }
@@ -1548,274 +1798,521 @@ impl AudioThread {
         });
     }
 
+    pub async fn remove_playlist(&mut self, name: String) -> std::io::Result<()> {
+        if name.eq("default") {
+            return Err(std::io::Error::other(
+                "You can't remove the 'default' playlist",
+            ));
+        }
+
+        let content = std::fs::read_to_string(self.playlist_save_path.as_str())?;
+        let mut map: HashMap<&str, Playlist> = serde_json::from_str(&content)?;
+        let mut playlist = match self.get_playlist(name.clone()).await {
+            Some(music) => music,
+            None => {
+                error!(playlist_name=? name,"Playlist does not exist");
+                return Ok(());
+            }
+        };
+        playlist.name = name.clone();
+
+        map.remove(name.as_str()).unwrap();
+
+        std::fs::write(
+            self.playlist_save_path.as_str(),
+            serde_json::to_string_pretty(&map)?,
+        )?;
+        Ok(())
+    }
+
+    pub async fn rename_playlist(&mut self, old: String, new: String) -> std::io::Result<()> {
+        if old.eq("default") {
+            return Err(std::io::Error::other(
+                "You can't rename the 'default' playlist",
+            ));
+        }
+        let content = std::fs::read_to_string(self.playlist_save_path.as_str())?;
+        let mut map: HashMap<&str, Playlist> = serde_json::from_str(&content)?;
+        let mut playlist = match self.get_playlist(old.clone()).await {
+            Some(music) => music,
+            None => {
+                error!(playlist_name=? old,"Playlist does not exist");
+                return Ok(());
+            }
+        };
+        playlist.name = new.clone();
+
+        map.remove(old.as_str()).unwrap();
+        map.insert(&new, playlist);
+
+        std::fs::write(
+            self.playlist_save_path.as_str(),
+            serde_json::to_string_pretty(&map)?,
+        )?;
+
+        Ok(())
+    }
+
+    pub async fn play_from_index(&mut self, index: u32) {
+        // TODO: what if this fail
+        // FIXME
+        self.playlist.playing_index = index;
+        let music = self.playlist.musics.get(index as usize).unwrap();
+
+        info!("playing music : {}", music);
+        self.sink.clear();
+        self.sink.append(
+            rodio::Decoder::try_from(
+                std::fs::File::open(PathBuf::from(music.path.clone())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let thing = self.action_sender.clone();
+        self.sink
+            .append(rodio::source::EmptyCallback::new(Box::new(move || {
+                thing.send(PlayAction::Ended).unwrap();
+            })));
+        self.sink.play();
+    }
+
+    // TODO: Make this method return an Result then log the error outside
+    #[allow(unreachable_code)]
+    #[instrument(name = "AudioThread", skip_all)]
+    pub async fn handle_action(&mut self, action: PlayAction) -> std::io::Result<()> {
+        match action {
+            PlayAction::PlayFromIndex(index) => {
+                self.play_from_index(index).await;
+            }
+            PlayAction::TogglePlay => {
+                if self.sink.is_paused() {
+                    self.sink.play();
+                } else {
+                    self.sink.pause();
+                }
+            }
+            PlayAction::Ended => match self.playlist.repeat {
+                // NOTE: using rt because we hit a `no reactor running` error
+                // NOTE: using light client because we want to send signals for
+                // the new playing music
+                Repeat::SameMusic => {
+                    let index = self.playlist.playing_index;
+                    let conn = Connection::session().await.unwrap_or_else(|_| {
+                        panic!("Could not connect to the bus address, aborting...");
+                    });
+                    let proxy = LightClientProxy::new(&conn).await.unwrap();
+                    proxy.play_from_index(index).await.unwrap();
+                    conn.close().await.unwrap();
+                }
+                Repeat::AllMusics => {
+                    let conn = Connection::session().await.unwrap_or_else(|_| {
+                        panic!("Could not connect to the bus address, aborting...");
+                    });
+                    let proxy = LightClientProxy::new(&conn).await.unwrap();
+                    proxy.play_next().await.unwrap();
+                    conn.close().await.unwrap();
+                    #[cfg(feature = "full-log")]
+                    info!("Playing next music");
+                }
+                Repeat::Dont => {}
+            },
+            PlayAction::Stop => {
+                self.sink.stop();
+            }
+            PlayAction::Quit => {
+                self.sink.stop();
+            }
+            PlayAction::Pause => {
+                self.sink.pause();
+            }
+            PlayAction::Resume => {
+                self.sink.play();
+            }
+            PlayAction::PlayNextMusic => {
+                let next_index = self.playlist.next_music_index();
+                self.action_sender
+                    .send(PlayAction::PlayFromIndex(next_index))
+                    .unwrap();
+            }
+            PlayAction::PlayPreviousMusic => {
+                let previous_index = self.playlist.previous_music_index();
+                self.action_sender
+                    .send(PlayAction::PlayFromIndex(previous_index))
+                    .unwrap();
+            }
+            PlayAction::Seek(duration) => {
+                let duration = Duration::from_secs_f64(duration);
+                self.sink.try_seek(duration).unwrap();
+            }
+            PlayAction::Repeat(repeat) => {
+                info!("Repeat: {repeat:?}");
+                self.playlist.repeat(repeat);
+            }
+            PlayAction::Sort(sort) => {
+                info!("Sort: {sort:?}");
+                self.playlist.sort(sort);
+            }
+            PlayAction::Volume(volume) => {
+                self.sink.set_volume(volume);
+            }
+            PlayAction::GetPlaylist => {
+                #[cfg(feature = "full-log")]
+                info!("Recived playlist request");
+                let playlist = self.playlist.clone();
+
+                #[cfg(feature = "full-log")]
+                info!("Sending playitst to requester");
+                self.data_sender.send(Response::Playlist(playlist)).unwrap();
+            }
+            PlayAction::GetPlaying | PlayAction::GetPlayingMusic => {
+                #[cfg(feature = "full-log")]
+                info!("Recived music info request");
+                let music = self.playlist.playing_music();
+
+                #[cfg(feature = "full-log")]
+                info!("Sending music info to requester");
+                self.data_sender.send(Response::Music(music)).unwrap();
+            }
+            PlayAction::GetPlayingIndex => {
+                #[cfg(feature = "full-log")]
+                info!("Recived playing index request");
+                let index = self.playlist.playing_index;
+
+                #[cfg(feature = "full-log")]
+                info!("Sending playing index requester");
+                self.data_sender
+                    .send(Response::PlayingIndex(index))
+                    .unwrap();
+            }
+            PlayAction::GetRepeat => {
+                #[cfg(feature = "full-log")]
+                info!("Recived repeat state request");
+                let repeat = self.playlist.repeat;
+
+                #[cfg(feature = "full-log")]
+                info!("Sending repeat state requester");
+                self.data_sender.send(Response::Repeat(repeat)).unwrap();
+            }
+            PlayAction::GetSort => {
+                info!("Recived sorting state request");
+                let sort = self.playlist.sort;
+                info!("Sending sorting state requester");
+                self.data_sender.send(Response::Sort(sort)).unwrap();
+            }
+            PlayAction::GetMetadata => {
+                #[cfg(feature = "full-log")]
+                info!("Recived sorting state request");
+                let metadata = self.playlist.playing_music().extract_matadata();
+
+                #[cfg(feature = "full-log")]
+                info!("Sending sorting state requester");
+                self.data_sender.send(Response::Metadata(metadata)).unwrap();
+            }
+            PlayAction::GetLyrics => {
+                #[cfg(feature = "full-log")]
+                info!("Recived Lyrics request");
+                let lyrics = self
+                    .playlist
+                    .playing_music()
+                    .extract_lyrics()
+                    .unwrap_or_default();
+
+                #[cfg(feature = "full-log")]
+                {
+                    info!("Sending lyrics to requester");
+                    info!("{lyrics}");
+                }
+                self.data_sender.send(Response::Lyrics(lyrics)).unwrap();
+            }
+            PlayAction::GetPlayedDuration => {
+                #[cfg(all(feature = "full-log", feature = "trivial"))]
+                info!("Recived played duration request");
+
+                let duration = self.sink.get_pos();
+                #[cfg(all(feature = "full-log", feature = "trivial"))]
+                info!("Sending played duration: {duration:?}");
+                self.data_sender
+                    .send(Response::PlayedDuration(duration))
+                    .unwrap();
+            }
+            PlayAction::GetVolume => {
+                #[cfg(feature = "full-log")]
+                info!("Recived volume info request");
+                let volume = self.sink.volume();
+
+                #[cfg(feature = "full-log")]
+                info!("Sending volume info: {volume:?}");
+                self.data_sender.send(Response::Volume(volume)).unwrap();
+            }
+            PlayAction::GetPreviousMusic => {
+                #[cfg(feature = "full-log")]
+                info!("Recived previous music info request");
+                let music = self.playlist.previous_music().unwrap_or_default();
+
+                #[cfg(feature = "full-log")]
+                info!("Sending previous music info: {music:?}");
+                self.data_sender
+                    .send(Response::PreviousMusic(music))
+                    .unwrap();
+            }
+            PlayAction::GetNextMusic => {
+                #[cfg(feature = "full-log")]
+                info!("Recived next music info request");
+
+                let music = self.playlist.next_music().unwrap_or_default();
+                #[cfg(feature = "full-log")]
+                info!("Sending next music info: {music:?}");
+                self.data_sender.send(Response::NextMusic(music)).unwrap();
+            }
+            PlayAction::GetPlayingStatus => {
+                let paused = self.sink.is_paused();
+                let emtpy = self.sink.empty();
+                if paused && emtpy {
+                    self.data_sender
+                        .send(Response::PlayingStatus(PlayingStatus::Stopped))
+                        .unwrap();
+                } else if paused && !emtpy {
+                    self.data_sender
+                        .send(Response::PlayingStatus(PlayingStatus::Pausing))
+                        .unwrap();
+                } else if !paused && !emtpy {
+                    self.data_sender
+                        .send(Response::PlayingStatus(PlayingStatus::Playing))
+                        .unwrap();
+                }
+            }
+            PlayAction::GetIndex => {
+                #[cfg(feature = "full-log")]
+                info!("Recived playing index request");
+                let index = self.playlist.playing_index;
+
+                #[cfg(feature = "full-log")]
+                info!("Sending playing index: {index}");
+                self.data_sender
+                    .send(Response::PlayingIndex(index))
+                    .unwrap();
+            }
+            PlayAction::GetTimer => {
+                #[cfg(all(feature = "full-log", feature = "trivial"))]
+                info!("Recived timer request");
+                let timer = (
+                    self.sink.get_pos().as_secs_f32(),
+                    self.playlist.playing_music().length.as_secs_f32(),
+                );
+                #[cfg(all(feature = "full-log", feature = "trivial"))]
+                info!("Sending timer info");
+                self.data_sender.send(Response::Timer(timer)).unwrap();
+            }
+            PlayAction::GetPlayerStatus => {
+                // FIXME
+                let music = self.playlist.playing_music();
+                let volume = self.sink.volume();
+                let index = self.playlist.playing_index;
+                let status = self.sink.status();
+                let player_status = PlayerStatus::new(status, music, volume, index);
+                self.data_sender
+                    .send(Response::PlayerStatus(player_status))
+                    .unwrap();
+            }
+            PlayAction::ReloadConfig(config) => {
+                self.playlist.reload_from_config(&config);
+            }
+            PlayAction::ToggleMute => {
+                if self.sink.volume().ne(&0.0) {
+                    self.extra.set_muted_volume(self.sink.volume());
+                    self.sink.set_volume(0.0);
+                } else {
+                    self.sink.set_volume(self.extra.muted_volume);
+                }
+            }
+            // ---------------------
+            PlayAction::AddToPlaylist(index, source, destination) => {
+                return self.add_to_playlist(index, source, destination).await
+            }
+            PlayAction::DeleteFromPlaylist(index, id) => {
+                return self.delete_from_playlist(index, id).await
+            }
+            PlayAction::LoadPlaylist(id) => return self.load_playlist(id).await,
+            PlayAction::DeletePlaylist(id) => return self.delete_playlist(id).await,
+            PlayAction::CreatePlaylist(id) => return self.create_playlist(id).await,
+            PlayAction::GetPlaylists => {
+                #[cfg(feature = "full-log")]
+                info!("Recived playlists request");
+                let playlists = self.get_playlists().await;
+
+                self.data_sender
+                    .send(Response::Playlists(playlists))
+                    .unwrap();
+            }
+            PlayAction::GetPlaylistName => {
+                #[cfg(feature = "full-log")]
+                info!("Recived playlist name request");
+                let name = self.playlist.name();
+
+                #[cfg(feature = "full-log")]
+                info!("Sending playlist name: {name:?}");
+                self.data_sender.send(Response::PlaylistName(name)).unwrap();
+            }
+            PlayAction::Play => {
+                self.play_from_index(self.playlist.playing_index).await;
+            }
+            PlayAction::RenamePlaylist(old, new) => {
+                self.rename_playlist(old, new).await;
+            }
+            PlayAction::RemovePlaylist(name) => {
+                self.remove_playlist(name).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn add_to_playlist(
+        &mut self,
+        index: usize,
+        source: String,
+        destination: String,
+    ) -> std::io::Result<()> {
+        let playlist = match self.get_playlist(source.clone()).await {
+            Some(music) => music,
+            None => {
+                error!(source_playlist=? source,"Playlist does not exist");
+                return Ok(());
+            }
+        };
+
+        match playlist.musics.get(index as usize) {
+            Some(music) => {
+                let content = std::fs::read_to_string(self.playlist_save_path.as_str())?;
+                let mut map: HashMap<&str, Playlist> = serde_json::from_str(&content)?;
+                let list = match map.get(destination.as_str()) {
+                    Some(list) => {
+                        let mut new_list = list.clone();
+                        new_list.musics.push(music.to_owned());
+                        new_list.musics.dedup();
+                        new_list
+                    }
+                    None => Playlist::default(),
+                };
+                map.insert(&destination, list.clone());
+
+                std::fs::write(
+                    self.playlist_save_path.as_str(),
+                    serde_json::to_string_pretty(&map)?,
+                )?;
+
+                if self.playlist.name().eq(&destination) {
+                    self.playlist = list;
+                }
+            }
+            None => error!(
+                destination = destination,
+                source = source,
+                index = index,
+                "Music index is out of bound"
+            ),
+        }
+
+        Ok(())
+    }
+
+    async fn delete_from_playlist(&mut self, index: usize, id: String) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(self.playlist_save_path.as_str())?;
+        let mut map: HashMap<&str, Playlist> = serde_json::from_str(&content)?;
+        match map.get(id.as_str()) {
+            Some(playlist) => {
+                if index > playlist.musics.len() {
+                    error!(
+                        playlist = id,
+                        index = index,
+                        "Can't delete music in playlist, index out of range"
+                    );
+                    return Ok(());
+                }
+                let mut new_list = playlist.clone();
+                new_list.musics.remove(index);
+                map.insert(id.as_str(), new_list);
+
+                std::fs::write(
+                    self.playlist_save_path.as_str(),
+                    serde_json::to_string_pretty(&map).unwrap(),
+                )
+                .unwrap();
+            }
+            None => {
+                error!(playlist = id, "No playlist found");
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_playlist(&mut self, id: String) -> std::io::Result<()> {
+        log(&id, "asdf.log").unwrap();
+        match self.get_playlist(id.clone()).await {
+            Some(playlist) => {
+                self.playlist = playlist;
+                self.playlist.playing_index = 0;
+                Ok(())
+            }
+            None => Err(std::io::Error::other(format!(
+                "Playlist with id {} does not exist",
+                id
+            ))),
+        }
+    }
+
+    async fn get_playlist(&mut self, id: String) -> Option<Playlist> {
+        self.get_playlists().await.get(&id).map(|v| v.to_owned())
+    }
+
+    async fn get_playlists(&mut self) -> HashMap<String, Playlist> {
+        let content = std::fs::read_to_string(self.playlist_save_path.as_str()).unwrap_or_default();
+        let all_playlists: HashMap<String, Playlist> =
+            serde_json::from_str(&content).unwrap_or_default();
+        all_playlists
+    }
+
+    async fn delete_playlist(&mut self, id: String) -> std::io::Result<()> {
+        if id.eq("default") {
+            error!("You can't delete the `default` playlist");
+            return Ok(());
+        }
+        let mut map = self.get_playlists().await;
+        let _ = map.remove(id.as_str());
+
+        std::fs::write(
+            self.playlist_save_path.as_str(),
+            serde_json::to_string_pretty(&map)?,
+        )?;
+        Ok(())
+    }
+
+    async fn create_playlist(&mut self, id: String) -> std::io::Result<()> {
+        let mut playlists = self.get_playlists().await;
+
+        match playlists.get(&id.clone()) {
+            Some(_) => {
+                error!(id=?id,"Can't create a new playlist, playlist already exist");
+                return Ok(());
+            }
+            None => {
+                let mut playlist = Playlist::default();
+                playlist.name = id.clone();
+                let _ = playlists.insert(id, playlist);
+                std::fs::write(
+                    self.playlist_save_path.as_str(),
+                    serde_json::to_string_pretty(&playlists)?,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
     #[allow(unreachable_code)]
     #[instrument(name = "AudioThread", skip_all)]
     pub async fn audio_thread(mut self) {
         loop {
-            if let Some(data) = self.action_reciver.recv().await {
-                match data {
-                    PlayAction::PlayFromIndex(index) => {
-                        // TODO: what if this fail
-                        // FIXME
-                        self.playlist.playing_index = index;
-                        let music = self.playlist.musics.get(index as usize).unwrap();
-
-                        info!("playing music : {}", music);
-                        self.sink.clear();
-                        self.sink.append(
-                            rodio::Decoder::try_from(
-                                std::fs::File::open(PathBuf::from(music.path.clone())).unwrap(),
-                            )
-                            .unwrap(),
-                        );
-                        let thing = self.action_sender.clone();
-                        self.sink
-                            .append(rodio::source::EmptyCallback::new(Box::new(move || {
-                                thing.send(PlayAction::Ended).unwrap();
-                            })));
-                        self.sink.play();
-                    }
-                    PlayAction::TogglePlay => {
-                        if self.sink.is_paused() {
-                            self.sink.play();
-                        } else {
-                            self.sink.pause();
-                        }
-                    }
-                    PlayAction::Ended => match self.playlist.repeat {
-                        // NOTE: using rt because we hit a `no reactor running` error
-                        // NOTE: using light client because we want to send signals for
-                        // the new playing music
-                        Repeat::SameMusic => {
-                            let index = self.playlist.playing_index;
-                            let conn = Connection::session().await.unwrap_or_else(|_| {
-                                panic!("Could not connect to the bus address, aborting...");
-                            });
-                            let proxy = LightClientProxy::new(&conn).await.unwrap();
-                            proxy.play_from_index(index).await.unwrap();
-                            conn.close().await.unwrap();
-                        }
-                        Repeat::AllMusics => {
-                            let conn = Connection::session().await.unwrap_or_else(|_| {
-                                panic!("Could not connect to the bus address, aborting...");
-                            });
-                            let proxy = LightClientProxy::new(&conn).await.unwrap();
-                            proxy.play_next().await.unwrap();
-                            conn.close().await.unwrap();
-                            #[cfg(feature = "full-log")]
-                            info!("Playing next music");
-                        }
-                        Repeat::Dont => {}
-                    },
-                    PlayAction::Stop => {
-                        self.sink.stop();
-                    }
-                    PlayAction::Quit => {
-                        self.sink.stop();
-                    }
-                    PlayAction::Pause => {
-                        self.sink.pause();
-                    }
-                    PlayAction::Resume => {
-                        self.sink.play();
-                    }
-                    PlayAction::PlayNextMusic => {
-                        let next_index = self.playlist.next_music_index();
-                        self.action_sender
-                            .send(PlayAction::PlayFromIndex(next_index))
-                            .unwrap();
-                    }
-                    PlayAction::PlayPreviousMusic => {
-                        let previous_index = self.playlist.previous_music_index();
-                        self.action_sender
-                            .send(PlayAction::PlayFromIndex(previous_index))
-                            .unwrap();
-                    }
-                    PlayAction::Seek(duration) => {
-                        let duration = Duration::from_secs_f64(duration);
-                        self.sink.try_seek(duration).unwrap();
-                    }
-                    PlayAction::Repeat(repeat) => {
-                        info!("Repeat: {repeat:?}");
-                        self.playlist.repeat(repeat);
-                    }
-                    PlayAction::Sort(sort) => {
-                        info!("Sort: {sort:?}");
-                        self.playlist.sort(sort);
-                    }
-                    PlayAction::Volume(volume) => {
-                        self.sink.set_volume(volume);
-                    }
-                    PlayAction::GetPlaylist => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived playlist request");
-                        let playlist = self.playlist.clone();
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending playitst to requester");
-                        self.data_sender.send(Response::Playlist(playlist)).unwrap();
-                    }
-                    PlayAction::GetPlaying | PlayAction::GetPlayingMusic => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived music info request");
-                        let music = self.playlist.playing_music();
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending music info to requester");
-                        self.data_sender.send(Response::Music(music)).unwrap();
-                    }
-                    PlayAction::GetPlayingIndex => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived playing index request");
-                        let index = self.playlist.playing_index;
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending playing index requester");
-                        self.data_sender
-                            .send(Response::PlayingIndex(index))
-                            .unwrap();
-                    }
-                    PlayAction::GetRepeat => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived repeat state request");
-                        let repeat = self.playlist.repeat;
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending repeat state requester");
-                        self.data_sender.send(Response::Repeat(repeat)).unwrap();
-                    }
-                    PlayAction::GetSort => {
-                        info!("Recived sorting state request");
-                        let sort = self.playlist.sort;
-                        info!("Sending sorting state requester");
-                        self.data_sender.send(Response::Sort(sort)).unwrap();
-                    }
-                    PlayAction::GetMetadata => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived sorting state request");
-                        let metadata = self.playlist.playing_music().extract_matadata();
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending sorting state requester");
-                        self.data_sender.send(Response::Metadata(metadata)).unwrap();
-                    }
-                    PlayAction::GetLyrics => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived Lyrics request");
-                        let lyrics = self
-                            .playlist
-                            .playing_music()
-                            .extract_lyrics()
-                            .unwrap_or_default();
-
-                        #[cfg(feature = "full-log")]
-                        {
-                            info!("Sending lyrics to requester");
-                            info!("{lyrics}");
-                        }
-                        self.data_sender.send(Response::Lyrics(lyrics)).unwrap();
-                    }
-                    PlayAction::GetPlayedDuration => {
-                        #[cfg(all(feature = "full-log", feature = "trivial"))]
-                        info!("Recived played duration request");
-
-                        let duration = self.sink.get_pos();
-                        #[cfg(all(feature = "full-log", feature = "trivial"))]
-                        info!("Sending played duration: {duration:?}");
-                        self.data_sender
-                            .send(Response::PlayedDuration(duration))
-                            .unwrap();
-                    }
-                    PlayAction::GetVolume => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived volume info request");
-                        let volume = self.sink.volume();
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending volume info: {volume:?}");
-                        self.data_sender.send(Response::Volume(volume)).unwrap();
-                    }
-                    PlayAction::GetPreviousMusic => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived previous music info request");
-                        let music = self.playlist.previous_music().unwrap_or_default();
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending previous music info: {music:?}");
-                        self.data_sender
-                            .send(Response::PreviousMusic(music))
-                            .unwrap();
-                    }
-                    PlayAction::GetNextMusic => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived next music info request");
-
-                        let music = self.playlist.next_music().unwrap_or_default();
-                        #[cfg(feature = "full-log")]
-                        info!("Sending next music info: {music:?}");
-                        self.data_sender.send(Response::NextMusic(music)).unwrap();
-                    }
-                    PlayAction::GetPlayingStatus => {
-                        let paused = self.sink.is_paused();
-                        let emtpy = self.sink.empty();
-                        if paused && emtpy {
-                            self.data_sender
-                                .send(Response::PlayingStatus(PlayingStatus::Stopped))
-                                .unwrap();
-                        } else if paused && !emtpy {
-                            self.data_sender
-                                .send(Response::PlayingStatus(PlayingStatus::Pausing))
-                                .unwrap();
-                        } else if !paused && !emtpy {
-                            self.data_sender
-                                .send(Response::PlayingStatus(PlayingStatus::Playing))
-                                .unwrap();
-                        }
-                    }
-                    PlayAction::GetIndex => {
-                        #[cfg(feature = "full-log")]
-                        info!("Recived playing index request");
-                        let index = self.playlist.playing_index;
-
-                        #[cfg(feature = "full-log")]
-                        info!("Sending playing index: {index}");
-                        self.data_sender
-                            .send(Response::PlayingIndex(index))
-                            .unwrap();
-                    }
-                    PlayAction::GetTimer => {
-                        #[cfg(all(feature = "full-log", feature = "trivial"))]
-                        info!("Recived timer request");
-                        let timer = (
-                            self.sink.get_pos().as_secs_f32(),
-                            self.playlist.playing_music().length.as_secs_f32(),
-                        );
-                        #[cfg(all(feature = "full-log", feature = "trivial"))]
-                        info!("Sending timer info");
-                        self.data_sender.send(Response::Timer(timer)).unwrap();
-                    }
-                    PlayAction::GetPlayerStatus => {
-                        // FIXME
-                        let music = self.playlist.playing_music();
-                        let volume = self.sink.volume();
-                        let index = self.playlist.playing_index;
-                        let status = self.sink.status();
-                        let player_status = PlayerStatus::new(status, music, volume, index);
-                        self.data_sender
-                            .send(Response::PlayerStatus(player_status))
-                            .unwrap();
-                    }
-                    PlayAction::ReloadConfig(config) => {
-                        self.playlist.reload_from_config(&config);
-                    }
-                    PlayAction::ToggleMute => {
-                        if self.sink.volume().ne(&0.0) {
-                            self.extra.set_muted_volume(self.sink.volume());
-                            self.sink.set_volume(0.0);
-                        } else {
-                            self.sink.set_volume(self.extra.muted_volume);
-                        }
-                    }
+            if let Some(action) = self.action_reciver.recv().await {
+                if let Err(e) = self.handle_action(action).await {
+                    error!(error=?e, "Error");
                 }
             }
         }
