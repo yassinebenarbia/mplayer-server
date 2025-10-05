@@ -31,7 +31,14 @@
         };
       in
       {
-        defaultPackage = naersk-lib.buildPackage ./.;
+        defaultPackage = naersk-lib.buildPackage {
+          name = "mplayer-server";
+          src = ./.;
+          buildInputs = with pkgs; [
+            pkg-config
+            alsa-lib
+          ];
+        };
         devShell =
           with pkgs;
           mkShell {
